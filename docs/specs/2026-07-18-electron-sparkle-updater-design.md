@@ -1,7 +1,7 @@
 # electron-sparkle-updater — design
 
 Date: 2026-07-18
-Status: approved (brainstormed in the kansoku session that extracted this library)
+Status: phases 1-2 implemented (brainstormed in the kansoku session that extracted this library)
 
 ## Why
 
@@ -17,7 +17,7 @@ In:
 - Cross-platform fallback updater (`./fallback`): platform-independent "weak" checker — GitHub releases polling, version comparison, throttling, result state — with app-injected callbacks for notification and opening URLs. Serves Windows/Linux (no Sparkle) and macOS when the bridge fails to load.
 - Consumer build tooling: a `rebuild` command that fetches a pinned, checksum-verified Sparkle.framework and runs `node-gyp rebuild` against the Electron ABI.
 - electron-builder integration (`./builder`): config fragments (Frameworks extraFiles, asarUnpack, `SUFeedURL`/`SUPublicEDKey` extendInfo placeholder convention, blockmap opt-out) and an afterPack ad-hoc signing hook.
-- Release toolchain: CLI wrapping Sparkle's `generate_appcast` (delta-base fetching, embedded release notes, enclosure URL re-pointing to per-tag release assets) and a reusable composite GitHub Action (fetch Sparkle tools, RAM-disk private-key signing, publish).
+- Release toolchain: CLI wrapping Sparkle's `generate_appcast` (embedded release notes, enclosure URL re-pointing to per-tag release assets) and a reusable composite GitHub Action (fetch Sparkle tools, delta-base download of previous release zips via `gh` + a token, RAM-disk private-key signing, publish).
 
 Platform positioning: this library solves a macOS-specific pain (Squirrel.Mac requires a paid signing identity; Sparkle works with ad-hoc signing). On Windows/Linux the ecosystem answer is already good — `electron-updater` (NSIS with differential updates; AppImage) or store channels (MSIX/winget, Snap/Flatpak) — so the recommended combination is "this library on macOS, electron-updater elsewhere". `./fallback` is the minimal notify-only option for apps that don't want electron-updater or ship formats without in-app update (bare zip, deb). This goes in the README.
 
@@ -40,7 +40,7 @@ electron-sparkle-updater/
 │   ├── src/sparkle_bridge.mm
 │   ├── binding.gyp
 │   └── scripts/fetch-sparkle.sh
-├── cli/                    # bin: rebuild, generate-appcast wrapper, fix-enclosure-urls, inject-public-key
+├── src/cli.ts              # bin entry: rebuild, generate-appcast, fix-appcast, inject-public-key
 ├── action/                 # composite GitHub Action for release CI
 └── docs/                   # integration guide
 ```
@@ -75,7 +75,7 @@ Extraction of Kansoku's `updater.ts` pure logic, parameterized:
 
 - `./builder` exports fragments the app merges into its own electron-builder config, plus the afterPack ad-hoc signing hook (sign once before dmg/zip are packaged so both embed a valid CodeDirectory).
 - The `SUPublicEDKey` placeholder convention (greppable string swapped by CI) is provided by the lib: `inject-public-key` CLI command.
-- `generate-appcast` CLI: wraps Sparkle's `generate_appcast` with delta-base download (previous N release zips filtered by tag prefix), `--embed-release-notes` from a sidecar `.md`, and enclosure URL re-pointing so old items reference their own release tags.
+- `generate-appcast` CLI: wraps Sparkle's `generate_appcast` with `--embed-release-notes` from a sidecar `.md` and enclosure URL re-pointing so old items reference their own release tags — the CLI itself stays offline; delta-base download of previous release zips (needs `gh` + a token) is the composite Action's job, run before the CLI.
 - Composite GitHub Action: fetch pinned Sparkle tools with checksum, write the EdDSA private key to a RAM disk only, sign + generate appcast, scrub the key, publish assets.
 
 ## Migration (dogfooding)
@@ -84,8 +84,8 @@ After phase 1 ships, `Innei/kansoku` `apps/desktop` drops its local `native/spar
 
 ## Phases
 
-1. Repo scaffolding + runtime bridge + `rebuild` command + `./builder` fragments — usable by hand-rolled CI.
-2. Release toolchain: CLI + composite Action + `./fallback`.
-3. Kansoku migration (separate repo, separate PRs).
+1. **Implemented.** Repo scaffolding + runtime bridge + `rebuild` command + `./builder` fragments — usable by hand-rolled CI.
+2. **Implemented.** Release toolchain: CLI (`inject-public-key`, `fix-appcast`, `generate-appcast`) + composite Action (`action/action.yml`) + `./fallback`.
+3. Kansoku migration (separate repo, separate PRs) — not started.
 
 Each phase is independently shippable.

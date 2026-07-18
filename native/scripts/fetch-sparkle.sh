@@ -30,8 +30,8 @@ if [ "$ACTUAL_SHA256" != "$SPARKLE_SHA256" ]; then
 fi
 
 echo "[fetch-sparkle] extracting"
-tar -xf "$TARBALL" -C "$VENDOR_DIR" "Sparkle.framework" "bin/generate_keys" "bin/sign_update"
+tar -xf "$TARBALL" -C "$VENDOR_DIR" "Sparkle.framework" "bin/generate_keys" "bin/sign_update" "bin/generate_appcast"
 rm -f "$TARBALL"
 
 touch "$STAMP_FILE"
-echo "[fetch-sparkle] done — Sparkle.framework + generate_keys/sign_update at $VENDOR_DIR"
+echo "[fetch-sparkle] done — Sparkle.framework + generate_keys/sign_update/generate_appcast at $VENDOR_DIR"

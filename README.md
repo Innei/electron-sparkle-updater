@@ -1,6 +1,6 @@
 # electron-sparkle-updater
 
-**Status: work in progress.** Phase 1 (this repo) is scaffolding + native bridge + rebuild CLI + builder fragments; the appcast CLI and release GitHub Action land in a later phase.
+**Status: work in progress.** Phases 1-2 are implemented: scaffolding + native bridge + rebuild CLI + builder fragments, the appcast CLI, the release GitHub Action, and `./fallback`. Kansoku migration (phase 3) is a separate repo/PR.
 
 Electron's update story on macOS is Squirrel.Mac (`electron-updater` / the built-in `autoUpdater`). Sparkle — the de-facto macOS update framework used by most native Mac apps — has no maintained Electron bridge on npm. This library provides one: an N-API bridge to Sparkle.framework plus the release toolchain (appcast generation, EdDSA signing, delta updates) needed to make Sparkle actually usable end to end, extracted from a production Electron app.
 
@@ -127,9 +127,141 @@ afterPack: scripts/afterPack.cjs
 
 Publishing a Sparkle release means: generating an appcast XML feed (`generate_appcast`, Sparkle's own tool) that lists each release's download URL, version, and EdDSA signature, keeping the EdDSA private key available to sign new releases without ever committing it, and optionally producing delta updates so returning users download a small binary diff instead of the full app.
 
-**Phase 1 (this package, today)** gives you the pieces to wire that up by hand in your own CI: `sparkleBuilderConfig` + `adHocSignAfterPack` produce a correctly-signed, Sparkle-ready `.app`/`.dmg`/`.zip`; you run Sparkle's own `generate_appcast` binary and manage the EdDSA keypair yourself.
+### Injecting the public key at build time
 
-**A CLI wrapper around `generate_appcast` (delta-base fetching, release-notes embedding, enclosure URL rewriting) and a reusable GitHub Action (pinned Sparkle tools, RAM-disk-only private key handling, sign + publish) land in phase 2.** See `docs/specs/2026-07-18-electron-sparkle-updater-design.md` for the full design.
+If you left `publicEdKey` out of `sparkleBuilderConfig` (see Packaging above), your packaged app still carries the placeholder `SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER`. Replace it with the real key as a build step, before signing/packaging:
+
+```
+electron-sparkle-updater inject-public-key --file path/to/Info.plist --key "$SPARKLE_ED_PUBLIC_KEY"
+```
+
+`--key` can also come from the `SPARKLE_ED_PUBLIC_KEY` environment variable when the flag is omitted. The command fails (non-zero exit) if the placeholder isn't found in the file — a fail-fast guard against silently shipping a build with no key at all. `--placeholder` overrides the default string if you changed it.
+
+### Archive directory layout
+
+`generate-appcast` and the composite Action both operate on a single **archive directory** per release:
+
+- your release's own `.zip` archive(s) (electron-builder output)
+- an optional sidecar `.md` file with the same basename as a zip — `generate_appcast --embed-release-notes` picks it up and embeds it as that item's release notes
+- populated by the tooling itself: previous releases' `appcast.xml` and their `.zip` archives (fetched in as delta bases), the newly generated/merged `appcast.xml`, and any `*.delta` binary diffs `generate_appcast` produces between the archives it finds
+
+### `generate-appcast` CLI
+
+```
+electron-sparkle-updater generate-appcast <archive-dir> \
+  --ed-key-file <path> \
+  --download-url-prefix <url> \
+  [--embed-release-notes] \
+  [--full-release-notes-url <url>] \
+  [--repo <owner/repo>] \
+  [--tag-prefix <string>] \
+  [--sparkle-bin <dir>]
+```
+
+Spawns Sparkle's own `generate_appcast` binary against `<archive-dir>` with the given flags. `--sparkle-bin` defaults to this package's vendored `native/vendor/bin` — run `electron-sparkle-updater rebuild` (or `native/scripts/fetch-sparkle.sh`) first if `generate_appcast` isn't there yet. When `--repo` is given, a successful run is followed by an in-process enclosure URL fix-up (see below) using `--tag-prefix`.
+
+### Enclosure URL re-pointing
+
+`generate_appcast` stamps every archive it processes — including old zips fetched in only as delta bases — with the current run's `--download-url-prefix`. That leaves older appcast items pointing at the new release tag, where those older assets were never uploaded (404). Enclosure URLs aren't covered by the EdDSA signatures (those sign file contents, not URLs), so rewriting each one back to the tag its own version was actually published under is safe. This runs automatically inside `generate-appcast --repo`, or standalone:
+
+This re-pointing assumes stable `x.y.z` release tags — prerelease suffixes (`-beta.1` and similar) and archive filenames whose first numeric triplet isn't the actual version will get matched to the wrong tag and repoint incorrectly.
+
+```
+electron-sparkle-updater fix-appcast <appcast-dir>/appcast.xml --repo <owner/repo> [--tag-prefix <string>]
+```
+
+### Composite GitHub Action
+
+`action/action.yml` encapsulates the whole per-release Sparkle flow: fetching pinned Sparkle tools, optionally downloading delta-base archives, signing + generating the appcast with the private key held only on a RAM disk, re-pointing enclosures, and (optionally) publishing the GitHub Release. It **requires a macOS runner** (uses `hdiutil`/`diskutil`/`shasum`) and a `GH_TOKEN`/`github-token` with permission to list/download/create releases on the target repo. The enclosure re-pointing step runs `npx electron-sparkle-updater fix-appcast`, so the calling workspace must already have `electron-sparkle-updater` installed as a dependency — the Action does not build this repo from source.
+
+Generate-only, let the caller publish (`publish` defaults to `false`):
+
+```yaml
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: pnpm install
+      - run: pnpm --filter my-app build && pnpm --filter my-app package
+      - uses: Innei/electron-sparkle-updater/action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          archive-dir: dist/release
+          ed-private-key: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          fetch-delta-bases: "false"
+      - run: gh release create "${{ github.ref_name }}" --draft dist/release/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+`fetch-delta-bases` is set to `"false"` here because the default (`"true"`) has the Action download previous releases' zips into `archive-dir` as delta bases — with that default, a plain `dist/release/*` glob on the publish step would re-upload those stale prior-release zips alongside the new build. If you need delta updates in a generate-only flow, leave `fetch-delta-bases` at its default and enumerate this release's own assets explicitly instead of globbing the archive directory (e.g. list the known output filenames, or filter by the current tag).
+
+Generate and publish in one step (`publish: true`):
+
+```yaml
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: pnpm install
+      - run: pnpm --filter my-app build && pnpm --filter my-app package
+      - uses: Innei/electron-sparkle-updater/action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          archive-dir: dist/release
+          ed-private-key: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          publish: "true"
+          dmg-path: dist/release/MyApp.dmg
+          notes-file: dist/release-notes.md
+```
+
+## Fallback updater (`./fallback`)
+
+For Windows/Linux (no Sparkle), or as a macOS fallback when `loadSparkleBridgeForApp` returns `null`, `./fallback` is a minimal notify-only updater: it polls a GitHub repo's `releases/latest`, compares versions, throttles repeat checks, and hands the result back to your app to render. It imports nothing from `electron` in its core, so it's directly unit-testable in plain Node; an Electron-flavored convenience wrapper sits on top.
+
+```ts
+import { checkForUpdate, githubLatestReleaseUrl } from "electron-sparkle-updater/fallback";
+
+const result = await checkForUpdate({
+  currentVersion: "1.2.3",
+  now: () => new Date().toISOString(),
+  fetchJson: (url) => fetch(url).then((r) => r.json()),
+  readLastCheck: async () => lastCheckIso,
+  writeLastCheck: async (iso) => {
+    lastCheckIso = iso;
+  },
+  notify: (release) => console.log(`update available: ${release.version}`),
+  releasesUrl: githubLatestReleaseUrl("my-org/my-app"),
+  tagPrefix: "v",
+});
+
+switch (result.kind) {
+  case "available":
+    // result.release: { version, htmlUrl }
+    break;
+  case "up-to-date":
+  case "throttled":
+  case "no-release":
+  case "fetch-failed":
+    break;
+}
+```
+
+Most Electron apps don't need to wire `checkForUpdate`'s deps by hand — `createElectronFallbackDeps` fills them in with `app.getVersion()`, a `updater.json` state file under `app.getPath("userData")`, and a native `Notification` that opens the release page on click:
+
+```ts
+import { checkForUpdate, createElectronFallbackDeps } from "electron-sparkle-updater/fallback";
+
+const deps = await createElectronFallbackDeps({
+  ownerRepo: "my-org/my-app",
+  tagPrefix: "v",
+  notificationTitle: "Update available",
+});
+
+const result = await checkForUpdate(deps);
+```
 
 ## Prior art / credits
 
