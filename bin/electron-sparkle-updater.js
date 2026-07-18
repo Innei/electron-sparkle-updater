@@ -1,3 +1,4 @@
 #!/usr/bin/env node
-console.error("electron-sparkle-updater CLI is not implemented yet.");
-process.exit(1);
+import { main } from "../dist/cli.js";
+
+process.exitCode = await main();

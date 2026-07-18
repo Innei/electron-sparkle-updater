@@ -3,3 +3,6 @@ dist/
 native/build/
 native/vendor/
 .superpowers/
+
+!test/fixtures/consumer-with-electron/node_modules/
+!test/fixtures/consumer-with-electron/node_modules/**
