@@ -1,0 +1,213 @@
+name: electron-sparkle-updater release
+description: >
+  Sign a macOS Electron release with Sparkle's EdDSA tooling, generate (and delta-diff)
+  its appcast.xml, repoint enclosure URLs at each asset's own release tag, and optionally
+  publish the GitHub Release. Requires a macOS runner (uses hdiutil/diskutil/shasum) and
+  a repo where the caller has already run its own package-manager install with
+  electron-sparkle-updater as a dependency — step 4 below shells out to that install's
+  `npx electron-sparkle-updater fix-appcast` rather than building this repo from source.
+
+inputs:
+  tag:
+    description: Release tag being built (e.g. desktop-v1.2.3).
+    required: true
+  archive-dir:
+    description: >
+      Directory containing this release's zip archive (and an optional sidecar .md file
+      with the same basename, picked up by generate_appcast as release notes). This
+      action also downloads previous releases' appcast.xml + zips into this same
+      directory to serve as delta bases, then generates appcast.xml (and any *.delta
+      patches) into it.
+    required: true
+  ed-private-key:
+    description: Sparkle EdDSA private key VALUE (not a file path) used to sign the appcast.
+    required: true
+  repo:
+    description: owner/repo whose releases are read from and (optionally) published to.
+    required: false
+    default: ${{ github.repository }}
+  tag-prefix:
+    description: Prefix stripped/matched on release tags (e.g. "desktop-v").
+    required: false
+    default: v
+  download-url-prefix:
+    description: >
+      URL prefix embedded in appcast enclosures. Defaults to this release's own
+      GitHub Release download URL: https://github.com/<repo>/releases/download/<tag>/
+    required: false
+    default: ""
+  full-release-notes-url:
+    description: URL embedded in the appcast as the full release-notes link.
+    required: false
+    default: ""
+  sparkle-version:
+    description: Sparkle release version to fetch generate_appcast/sign_update from.
+    required: false
+    default: "2.9.4"
+  sparkle-sha256:
+    description: Expected sha256 of the Sparkle release tarball (verified before extraction).
+    required: false
+    default: "ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9"
+  delta-bases:
+    description: How many previous releases' zips to fetch as delta-patch bases.
+    required: false
+    default: "2"
+  fetch-delta-bases:
+    description: Whether to fetch previous appcast.xml + zips at all (set false for a first release).
+    required: false
+    default: "true"
+  publish:
+    description: >
+      When true, publish a GitHub Release for `tag` with the dmg/zip/appcast/deltas as
+      assets. When false (default), this action only generates/signs the appcast and
+      leaves publishing (draft review, custom asset lists, etc.) to the caller.
+    required: false
+    default: "false"
+  dmg-path:
+    description: Path to the .dmg to upload. Only used when publish=true.
+    required: false
+    default: ""
+  notes-file:
+    description: Path to a release-notes file passed to `gh release create --notes-file`. Only used when publish=true.
+    required: false
+    default: ""
+  github-token:
+    description: Token used for `gh release list/download/create` calls.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: fetch Sparkle tools
+      shell: bash
+      env:
+        SPARKLE_VERSION: ${{ inputs.sparkle-version }}
+        SPARKLE_TARBALL_SHA256: ${{ inputs.sparkle-sha256 }}
+      run: |
+        set -euo pipefail
+        TOOLS_DIR="$RUNNER_TEMP/electron-sparkle-updater-tools"
+        TARBALL="$RUNNER_TEMP/sparkle.tar.xz"
+        curl -sSL -o "$TARBALL" \
+          "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+        echo "${SPARKLE_TARBALL_SHA256}  $TARBALL" | shasum -a 256 -c -
+        mkdir -p "$TOOLS_DIR"
+        tar -xf "$TARBALL" -C "$TOOLS_DIR" bin/
+        chmod +x "$TOOLS_DIR"/bin/*
+        echo "$TOOLS_DIR/bin" >> "$GITHUB_PATH"
+
+    - name: record this release's own archive name(s)
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCHIVE_DIR="${{ inputs.archive-dir }}"
+        {
+          echo "OWN_RELEASE_ZIPS<<EOF_OWN_RELEASE_ZIPS"
+          (shopt -s nullglob; for f in "$ARCHIVE_DIR"/*.zip; do basename "$f"; done)
+          echo "EOF_OWN_RELEASE_ZIPS"
+        } >> "$GITHUB_ENV"
+
+    - name: fetch existing appcast + last N release archives (delta base)
+      if: ${{ inputs.fetch-delta-bases == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ inputs.repo }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        DELTA_BASES: ${{ inputs.delta-bases }}
+      run: |
+        set -euo pipefail
+        # old zips are fetched into the same dir generate_appcast scans so it can
+        # diff them for deltas, but they must NOT be re-uploaded as this release's
+        # own assets — the publish step only uploads this release's own zip(s)
+        # (recorded above, before this step adds any old ones), plus dmg/appcast/deltas.
+        # The target repo may also host non-<tag-prefix> releases, so these queries
+        # filter explicitly by tag-prefix rather than trusting "latest across the whole
+        # repo" — an unrelated release published afterwards would otherwise get picked
+        # as the delta base.
+        ARCHIVE_DIR="${{ inputs.archive-dir }}"
+        LATEST_TAG="$(gh release list --repo "$REPO" --exclude-drafts --limit 20 --json tagName \
+          -q "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))][0].tagName" 2>/dev/null || true)"
+        if [ -n "$LATEST_TAG" ]; then
+          gh release download --repo "$REPO" --pattern 'appcast.xml' --dir "$ARCHIVE_DIR" "$LATEST_TAG" \
+            || echo "no appcast.xml asset on latest release $LATEST_TAG"
+        else
+          echo "no previous release found — generate_appcast will create a fresh appcast.xml"
+        fi
+        PREV_TAGS="$(gh release list --repo "$REPO" --exclude-drafts --limit 20 --json tagName \
+          -q "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))][0:${DELTA_BASES}][].tagName" 2>/dev/null || true)"
+        for T in $PREV_TAGS; do
+          gh release download --repo "$REPO" --pattern '*.zip' --dir "$ARCHIVE_DIR" "$T" \
+            || echo "no zip asset on release $T, skipping"
+        done
+
+    - name: sign + generate appcast (EdDSA key lives only on a RAM disk)
+      shell: bash
+      env:
+        SPARKLE_ED_PRIVATE_KEY: ${{ inputs.ed-private-key }}
+        REPO: ${{ inputs.repo }}
+        TAG: ${{ inputs.tag }}
+        ARCHIVE_DIR: ${{ inputs.archive-dir }}
+        DOWNLOAD_URL_PREFIX: ${{ inputs.download-url-prefix }}
+        FULL_RELEASE_NOTES_URL: ${{ inputs.full-release-notes-url }}
+      run: |
+        set -euo pipefail
+        DOWNLOAD_URL_PREFIX="${DOWNLOAD_URL_PREFIX:-https://github.com/${REPO}/releases/download/${TAG}/}"
+        FULL_RELEASE_NOTES_URL="${FULL_RELEASE_NOTES_URL:-https://github.com/${REPO}/releases}"
+
+        DEV="$(hdiutil attach -nomount ram://16384 | awk '{print $1}')"
+        diskutil erasevolume HFS+ SparkleKeyRAM "$DEV" >/dev/null
+        KEY_DIR="/Volumes/SparkleKeyRAM"
+        KEY_FILE="$KEY_DIR/ed_private_key"
+        printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEY_FILE"
+
+        generate_appcast \
+          --ed-key-file "$KEY_FILE" \
+          --download-url-prefix "$DOWNLOAD_URL_PREFIX" \
+          --embed-release-notes \
+          --full-release-notes-url "$FULL_RELEASE_NOTES_URL" \
+          "$ARCHIVE_DIR"
+
+        dd if=/dev/urandom of="$KEY_FILE" bs=1024 count=4 conv=notrunc 2>/dev/null
+        rm -f "$KEY_FILE"
+        hdiutil detach "$DEV"
+
+    - name: repoint old appcast enclosures at their own release tags
+      shell: bash
+      run: |
+        set -euo pipefail
+        npx electron-sparkle-updater fix-appcast "${{ inputs.archive-dir }}/appcast.xml" \
+          --repo "${{ inputs.repo }}" \
+          --tag-prefix "${{ inputs.tag-prefix }}"
+
+    - name: publish GitHub Release
+      if: ${{ inputs.publish == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ inputs.repo }}
+        TAG: ${{ inputs.tag }}
+        ARCHIVE_DIR: ${{ inputs.archive-dir }}
+        DMG_PATH: ${{ inputs.dmg-path }}
+        NOTES_FILE: ${{ inputs.notes-file }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        ASSETS=()
+        [ -n "$DMG_PATH" ] && ASSETS+=("$DMG_PATH")
+        while IFS= read -r ZIP_NAME; do
+          [ -n "$ZIP_NAME" ] && ASSETS+=("$ARCHIVE_DIR/$ZIP_NAME")
+        done <<< "$OWN_RELEASE_ZIPS"
+        ASSETS+=("$ARCHIVE_DIR/appcast.xml")
+        ASSETS+=("$ARCHIVE_DIR"/*.delta)
+
+        NOTES_ARGS=()
+        [ -n "$NOTES_FILE" ] && NOTES_ARGS=(--notes-file "$NOTES_FILE")
+
+        # published immediately (no --draft): consumers typically point their Sparkle
+        # feed at releases/latest/download/appcast.xml, so publishing IS the rollout.
+        gh release create "$TAG" \
+          --repo "$REPO" \
+          --title "$TAG" \
+          "${NOTES_ARGS[@]}" \
+          "${ASSETS[@]}"
