@@ -9,6 +9,7 @@ Electron's update story on macOS is Squirrel.Mac (`electron-updater` / the built
 ## Requirements
 
 - macOS 12+ (matches Sparkle's `MACOSX_DEPLOYMENT_TARGET`)
+- Node >= 20.19 (the afterPack wrapper relies on require() of ES modules)
 - Electron >= 28
 - Xcode Command Line Tools (`xcode-select --install`) — needed to compile the native addon
 - Either ad-hoc signing or a Developer ID certificate; both work with Sparkle

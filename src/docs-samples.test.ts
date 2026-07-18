@@ -8,7 +8,7 @@ describe("README runtime sample", () => {
     expect(loadSparkleBridgeForApp.length).toBe(1);
   });
 
-  it("bridge returned by loadSparkleBridge exposes the four documented methods", () => {
+  it("loadSparkleBridge returns null when the addon cannot be loaded", () => {
     const bridge = loadSparkleBridge({
       isPackaged: false,
       resourcesPath: "/nonexistent",
