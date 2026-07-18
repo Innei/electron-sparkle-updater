@@ -1,11 +1,16 @@
-import { copyFileSync, rmSync } from "node:fs";
+import { copyFileSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { fixAppcastEnclosureUrls, injectPublicKey } from "./appcast.js";
+import { SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER } from "./builder.js";
 
-const USAGE = `Usage: electron-sparkle-updater rebuild [--electron-version <v>] [--arch arm64|x64|universal] [--force-fetch]`;
+const USAGE = `Usage:
+  electron-sparkle-updater rebuild [--electron-version <v>] [--arch arm64|x64|universal] [--force-fetch]
+  electron-sparkle-updater inject-public-key --file <path> --key <value> [--placeholder <string>]
+  electron-sparkle-updater fix-appcast <appcast.xml> --repo <owner/repo> [--tag-prefix <string>]`;
 
 type Arch = "arm64" | "x64" | "universal";
 
@@ -15,24 +20,29 @@ export interface RebuildOptions {
   forceFetch: boolean;
 }
 
+export interface InjectPublicKeyOptions {
+  file: string;
+  key?: string;
+  placeholder: string;
+}
+
+export interface FixAppcastOptions {
+  appcastPath: string;
+  repo: string;
+  tagPrefix: string;
+}
+
 export type ParsedCommand =
   | { kind: "rebuild"; options: RebuildOptions }
+  | { kind: "inject-public-key"; options: InjectPublicKeyOptions }
+  | { kind: "fix-appcast"; options: FixAppcastOptions }
   | { kind: "usage"; exitCode: number; message?: string };
 
 function isArch(value: string): value is Arch {
   return value === "arm64" || value === "x64" || value === "universal";
 }
 
-export function parseCliArgs(argv: string[]): ParsedCommand {
-  const [command, ...rest] = argv;
-  if (command !== "rebuild") {
-    return {
-      kind: "usage",
-      exitCode: 1,
-      message: command ? `unknown command: ${command}` : undefined,
-    };
-  }
-
+function parseRebuildArgs(rest: string[]): ParsedCommand {
   let values: { [key: string]: string | boolean | undefined };
   try {
     ({ values } = parseArgs({
@@ -61,6 +71,92 @@ export function parseCliArgs(argv: string[]): ParsedCommand {
       forceFetch: Boolean(values["force-fetch"]),
     },
   };
+}
+
+function parseInjectPublicKeyArgs(rest: string[]): ParsedCommand {
+  let values: { [key: string]: string | boolean | undefined };
+  try {
+    ({ values } = parseArgs({
+      args: rest,
+      options: {
+        file: { type: "string" },
+        key: { type: "string" },
+        placeholder: { type: "string" },
+      },
+      strict: true,
+    }));
+  } catch (err) {
+    return { kind: "usage", exitCode: 1, message: (err as Error).message };
+  }
+
+  const file = values.file as string | undefined;
+  if (!file) {
+    return { kind: "usage", exitCode: 1, message: "--file is required" };
+  }
+
+  return {
+    kind: "inject-public-key",
+    options: {
+      file,
+      key: values.key as string | undefined,
+      placeholder: (values.placeholder as string | undefined) ?? SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
+    },
+  };
+}
+
+function parseFixAppcastArgs(rest: string[]): ParsedCommand {
+  let values: { [key: string]: string | boolean | undefined };
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      options: {
+        repo: { type: "string" },
+        "tag-prefix": { type: "string" },
+      },
+      allowPositionals: true,
+      strict: true,
+    }));
+  } catch (err) {
+    return { kind: "usage", exitCode: 1, message: (err as Error).message };
+  }
+
+  const appcastPath = positionals[0];
+  if (!appcastPath) {
+    return { kind: "usage", exitCode: 1, message: "appcast.xml path is required" };
+  }
+
+  const repo = values.repo as string | undefined;
+  if (!repo) {
+    return { kind: "usage", exitCode: 1, message: "--repo is required" };
+  }
+
+  return {
+    kind: "fix-appcast",
+    options: {
+      appcastPath,
+      repo,
+      tagPrefix: (values["tag-prefix"] as string | undefined) ?? "v",
+    },
+  };
+}
+
+export function parseCliArgs(argv: string[]): ParsedCommand {
+  const [command, ...rest] = argv;
+  switch (command) {
+    case "rebuild":
+      return parseRebuildArgs(rest);
+    case "inject-public-key":
+      return parseInjectPublicKeyArgs(rest);
+    case "fix-appcast":
+      return parseFixAppcastArgs(rest);
+    default:
+      return {
+        kind: "usage",
+        exitCode: 1,
+        message: command ? `unknown command: ${command}` : undefined,
+      };
+  }
 }
 
 export function resolveElectronVersion(cwd: string): string {
@@ -189,6 +285,46 @@ function removeVendorDir(nativeDir: string): void {
   rmSync(join(nativeDir, "vendor"), { recursive: true, force: true });
 }
 
+export interface FileSystemDeps {
+  readFile: (path: string) => string;
+  writeFile: (path: string, content: string) => void;
+  log?: (message: string) => void;
+  errorLog?: (message: string) => void;
+}
+
+export interface RunInjectPublicKeyDeps extends FileSystemDeps {
+  env: NodeJS.ProcessEnv;
+}
+
+export function runInjectPublicKey(options: InjectPublicKeyOptions, deps: RunInjectPublicKeyDeps): number {
+  const key = options.key ?? deps.env.SPARKLE_ED_PUBLIC_KEY;
+  if (!key) {
+    deps.errorLog?.("no key provided: pass --key or set the SPARKLE_ED_PUBLIC_KEY environment variable");
+    return 1;
+  }
+
+  const content = deps.readFile(options.file);
+  let result: ReturnType<typeof injectPublicKey>;
+  try {
+    result = injectPublicKey(content, key, options.placeholder);
+  } catch (err) {
+    deps.errorLog?.(`${options.file}: ${(err as Error).message}`);
+    return 1;
+  }
+
+  deps.writeFile(options.file, result.content);
+  deps.log?.(`${result.replacements} occurrence(s) of ${options.placeholder} replaced in ${options.file}`);
+  return 0;
+}
+
+export function runFixAppcast(options: FixAppcastOptions, deps: FileSystemDeps): number {
+  const xml = deps.readFile(options.appcastPath);
+  const result = fixAppcastEnclosureUrls(xml, options.repo, options.tagPrefix);
+  deps.writeFile(options.appcastPath, result.xml);
+  deps.log?.(`${result.rewrites} enclosure URL(s) rewritten in ${options.appcastPath}`);
+  return 0;
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const parsed = parseCliArgs(argv);
   if (parsed.kind === "usage") {
@@ -197,6 +333,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     }
     console.error(USAGE);
     return parsed.exitCode;
+  }
+
+  const fileSystemDeps: FileSystemDeps = {
+    readFile: (path) => readFileSync(path, "utf8"),
+    writeFile: (path, content) => writeFileSync(path, content),
+    log: (message) => console.log(message),
+    errorLog: (message) => console.error(message),
+  };
+
+  if (parsed.kind === "inject-public-key") {
+    return runInjectPublicKey(parsed.options, { ...fileSystemDeps, env: process.env });
+  }
+
+  if (parsed.kind === "fix-appcast") {
+    return runFixAppcast(parsed.options, fileSystemDeps);
   }
 
   const nativeDir = join(dirname(fileURLToPath(import.meta.url)), "..", "native");

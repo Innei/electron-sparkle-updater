@@ -3,8 +3,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseCliArgs, resolveElectronVersion, runRebuild } from "./cli.js";
-import type { RunRebuildDeps, SpawnFn, SpawnResult } from "./cli.js";
+import { parseCliArgs, resolveElectronVersion, runFixAppcast, runInjectPublicKey, runRebuild } from "./cli.js";
+import type {
+  FileSystemDeps,
+  RunInjectPublicKeyDeps,
+  RunRebuildDeps,
+  SpawnFn,
+  SpawnResult,
+} from "./cli.js";
+import { SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER } from "./builder.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(here, "..", "test", "fixtures");
@@ -82,6 +89,149 @@ describe("parseCliArgs", () => {
   it("rejects an unknown flag", () => {
     const result = parseCliArgs(["rebuild", "--bogus"]);
     expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+});
+
+describe("parseCliArgs inject-public-key", () => {
+  it("parses --file, --key and defaults --placeholder to the builder constant", () => {
+    const result = parseCliArgs(["inject-public-key", "--file", "Info.plist", "--key", "real-key"]);
+    expect(result).toEqual({
+      kind: "inject-public-key",
+      options: { file: "Info.plist", key: "real-key", placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER },
+    });
+  });
+
+  it("accepts a custom --placeholder", () => {
+    const result = parseCliArgs([
+      "inject-public-key",
+      "--file",
+      "Info.plist",
+      "--key",
+      "real-key",
+      "--placeholder",
+      "<<KEY>>",
+    ]);
+    expect(result).toMatchObject({ options: { placeholder: "<<KEY>>" } });
+  });
+
+  it("leaves key undefined when --key is omitted (env fallback handled at run time)", () => {
+    const result = parseCliArgs(["inject-public-key", "--file", "Info.plist"]);
+    expect(result).toEqual({
+      kind: "inject-public-key",
+      options: { file: "Info.plist", key: undefined, placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER },
+    });
+  });
+
+  it("rejects a missing --file", () => {
+    const result = parseCliArgs(["inject-public-key", "--key", "real-key"]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+});
+
+describe("parseCliArgs fix-appcast", () => {
+  it("parses the positional appcast path and --repo, defaulting --tag-prefix to v", () => {
+    const result = parseCliArgs(["fix-appcast", "appcast.xml", "--repo", "owner/repo"]);
+    expect(result).toEqual({
+      kind: "fix-appcast",
+      options: { appcastPath: "appcast.xml", repo: "owner/repo", tagPrefix: "v" },
+    });
+  });
+
+  it("accepts a custom --tag-prefix", () => {
+    const result = parseCliArgs(["fix-appcast", "appcast.xml", "--repo", "owner/repo", "--tag-prefix", "desktop-v"]);
+    expect(result).toMatchObject({ options: { tagPrefix: "desktop-v" } });
+  });
+
+  it("rejects a missing appcast path", () => {
+    const result = parseCliArgs(["fix-appcast", "--repo", "owner/repo"]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+
+  it("rejects a missing --repo", () => {
+    const result = parseCliArgs(["fix-appcast", "appcast.xml"]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+});
+
+describe("runInjectPublicKey", () => {
+  function makeFsDeps(overrides: Partial<RunInjectPublicKeyDeps> = {}): RunInjectPublicKeyDeps {
+    return {
+      readFile: vi.fn().mockReturnValue(`a ${SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER} b`),
+      writeFile: vi.fn(),
+      log: vi.fn(),
+      errorLog: vi.fn(),
+      env: {},
+      ...overrides,
+    };
+  }
+
+  it("reads the file, replaces the placeholder and writes it back", () => {
+    const deps = makeFsDeps();
+    const code = runInjectPublicKey(
+      { file: "Info.plist", key: "real-key", placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(deps.readFile).toHaveBeenCalledWith("Info.plist");
+    expect(deps.writeFile).toHaveBeenCalledWith("Info.plist", "a real-key b");
+    expect(deps.log).toHaveBeenCalledWith(expect.stringMatching(/1 occurrence/));
+  });
+
+  it("falls back to the SPARKLE_ED_PUBLIC_KEY env var when --key is omitted", () => {
+    const deps = makeFsDeps({ env: { SPARKLE_ED_PUBLIC_KEY: "env-key" } });
+    const code = runInjectPublicKey(
+      { file: "Info.plist", placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(deps.writeFile).toHaveBeenCalledWith("Info.plist", "a env-key b");
+  });
+
+  it("errors when neither --key nor the env var is provided, without touching the file", () => {
+    const deps = makeFsDeps();
+    const code = runInjectPublicKey({ file: "Info.plist", placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER }, deps);
+    expect(code).toBe(1);
+    expect(deps.readFile).not.toHaveBeenCalled();
+    expect(deps.writeFile).not.toHaveBeenCalled();
+    expect(deps.errorLog).toHaveBeenCalledWith(expect.stringMatching(/SPARKLE_ED_PUBLIC_KEY/));
+  });
+
+  it("errors naming the file and placeholder when the placeholder is absent", () => {
+    const deps = makeFsDeps({ readFile: vi.fn().mockReturnValue("no placeholder here") });
+    const code = runInjectPublicKey(
+      { file: "Info.plist", key: "real-key", placeholder: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER },
+      deps,
+    );
+    expect(code).toBe(1);
+    expect(deps.writeFile).not.toHaveBeenCalled();
+    expect(deps.errorLog).toHaveBeenCalledWith(expect.stringContaining("Info.plist"));
+    expect(deps.errorLog).toHaveBeenCalledWith(expect.stringContaining(SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER));
+  });
+});
+
+describe("runFixAppcast", () => {
+  function makeFsDeps(overrides: Partial<FileSystemDeps> = {}): FileSystemDeps {
+    return {
+      readFile: vi
+        .fn()
+        .mockReturnValue('<enclosure url="https://github.com/owner/repo/releases/download/vOLD/App-1.2.3.zip" />'),
+      writeFile: vi.fn(),
+      log: vi.fn(),
+      errorLog: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("reads, rewrites and writes back the appcast, logging the rewrite count", () => {
+    const deps = makeFsDeps();
+    const code = runFixAppcast({ appcastPath: "appcast.xml", repo: "owner/repo", tagPrefix: "v" }, deps);
+    expect(code).toBe(0);
+    expect(deps.readFile).toHaveBeenCalledWith("appcast.xml");
+    expect(deps.writeFile).toHaveBeenCalledWith(
+      "appcast.xml",
+      expect.stringContaining("v1.2.3/App-1.2.3.zip"),
+    );
+    expect(deps.log).toHaveBeenCalledWith(expect.stringMatching(/1 enclosure URL/));
   });
 });
 
