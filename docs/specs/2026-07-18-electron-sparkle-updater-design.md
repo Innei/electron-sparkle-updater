@@ -1,7 +1,7 @@
 # electron-sparkle-updater — design
 
 Date: 2026-07-18
-Status: approved (brainstormed in the kansoku session that extracted this library)
+Status: phases 1-2 implemented (brainstormed in the kansoku session that extracted this library)
 
 ## Why
 
@@ -84,8 +84,8 @@ After phase 1 ships, `Innei/kansoku` `apps/desktop` drops its local `native/spar
 
 ## Phases
 
-1. Repo scaffolding + runtime bridge + `rebuild` command + `./builder` fragments — usable by hand-rolled CI.
-2. Release toolchain: CLI + composite Action + `./fallback`.
-3. Kansoku migration (separate repo, separate PRs).
+1. **Implemented.** Repo scaffolding + runtime bridge + `rebuild` command + `./builder` fragments — usable by hand-rolled CI.
+2. **Implemented.** Release toolchain: CLI (`inject-public-key`, `fix-appcast`, `generate-appcast`) + composite Action (`action/action.yml`) + `./fallback`.
+3. Kansoku migration (separate repo, separate PRs) — not started.
 
 Each phase is independently shippable.
