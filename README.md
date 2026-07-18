@@ -81,6 +81,8 @@ For advanced layouts, `loadSparkleBridge(deps)` (the lower-level function `loadS
 
 ## Packaging
 
+Packaging fails unless `rebuild` has already run: both the native addon (`native/build/Release/sparkle_bridge.node`, unpacked into the packaged app) and `native/vendor/Sparkle.framework` (read by the `extraFiles` entry below) are produced by that command, not by `pnpm install` or `tsc`.
+
 `sparkleBuilderConfig` returns the electron-builder config fragment this library needs — extend, don't replace, your existing config:
 
 ```ts
