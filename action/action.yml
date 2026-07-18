@@ -4,8 +4,9 @@ description: >
   its appcast.xml, repoint enclosure URLs at each asset's own release tag, and optionally
   publish the GitHub Release. Requires a macOS runner (uses hdiutil/diskutil/shasum) and
   a repo where the caller has already run its own package-manager install with
-  electron-sparkle-updater as a dependency — step 4 below shells out to that install's
-  `npx electron-sparkle-updater fix-appcast` rather than building this repo from source.
+  electron-sparkle-updater as a dependency — the enclosure re-pointing step shells out to
+  that install's `npx electron-sparkle-updater fix-appcast` rather than building this repo
+  from source.
 
 inputs:
   tag:

@@ -170,7 +170,7 @@ electron-sparkle-updater fix-appcast <appcast-dir>/appcast.xml --repo <owner/rep
 
 ### Composite GitHub Action
 
-`action/action.yml` encapsulates the whole per-release Sparkle flow: fetching pinned Sparkle tools, optionally downloading delta-base archives, signing + generating the appcast with the private key held only on a RAM disk, re-pointing enclosures, and (optionally) publishing the GitHub Release. It **requires a macOS runner** (uses `hdiutil`/`diskutil`/`shasum`) and a `GH_TOKEN`/`github-token` with permission to list/download/create releases on the target repo. Step 4 (enclosure re-pointing) runs `npx electron-sparkle-updater fix-appcast`, so the calling workspace must already have `electron-sparkle-updater` installed as a dependency — the Action does not build this repo from source.
+`action/action.yml` encapsulates the whole per-release Sparkle flow: fetching pinned Sparkle tools, optionally downloading delta-base archives, signing + generating the appcast with the private key held only on a RAM disk, re-pointing enclosures, and (optionally) publishing the GitHub Release. It **requires a macOS runner** (uses `hdiutil`/`diskutil`/`shasum`) and a `GH_TOKEN`/`github-token` with permission to list/download/create releases on the target repo. The enclosure re-pointing step runs `npx electron-sparkle-updater fix-appcast`, so the calling workspace must already have `electron-sparkle-updater` installed as a dependency — the Action does not build this repo from source.
 
 Generate-only, let the caller publish (`publish` defaults to `false`):
 
@@ -183,8 +183,6 @@ jobs:
       - run: pnpm install
       - run: pnpm --filter my-app build && pnpm --filter my-app package
       - uses: Innei/electron-sparkle-updater/action@v1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag: ${{ github.ref_name }}
           archive-dir: dist/release
@@ -205,8 +203,6 @@ jobs:
       - run: pnpm install
       - run: pnpm --filter my-app build && pnpm --filter my-app package
       - uses: Innei/electron-sparkle-updater/action@v1
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag: ${{ github.ref_name }}
           archive-dir: dist/release
