@@ -98,9 +98,10 @@ runs:
 
     - name: record this release's own archive name(s)
       shell: bash
+      env:
+        ARCHIVE_DIR: ${{ inputs.archive-dir }}
       run: |
         set -euo pipefail
-        ARCHIVE_DIR="${{ inputs.archive-dir }}"
         {
           echo "OWN_RELEASE_ZIPS<<EOF_OWN_RELEASE_ZIPS"
           (shopt -s nullglob; for f in "$ARCHIVE_DIR"/*.zip; do basename "$f"; done)
@@ -115,6 +116,7 @@ runs:
         REPO: ${{ inputs.repo }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
         DELTA_BASES: ${{ inputs.delta-bases }}
+        ARCHIVE_DIR: ${{ inputs.archive-dir }}
       run: |
         set -euo pipefail
         # old zips are fetched into the same dir generate_appcast scans so it can
@@ -125,7 +127,7 @@ runs:
         # filter explicitly by tag-prefix rather than trusting "latest across the whole
         # repo" — an unrelated release published afterwards would otherwise get picked
         # as the delta base.
-        ARCHIVE_DIR="${{ inputs.archive-dir }}"
+        [[ "$DELTA_BASES" =~ ^[0-9]+$ ]] || { echo "::error::delta-bases must be a non-negative integer"; exit 1; }
         LATEST_TAG="$(gh release list --repo "$REPO" --exclude-drafts --limit 20 --json tagName \
           -q "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))][0].tagName" 2>/dev/null || true)"
         if [ -n "$LATEST_TAG" ]; then
@@ -161,6 +163,13 @@ runs:
         KEY_FILE="$KEY_DIR/ed_private_key"
         printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEY_FILE"
 
+        cleanup() {
+          dd if=/dev/urandom of="$KEY_FILE" bs=1024 count=4 conv=notrunc 2>/dev/null || true
+          rm -f "$KEY_FILE" || true
+          hdiutil detach "$DEV" || true
+        }
+        trap cleanup EXIT
+
         generate_appcast \
           --ed-key-file "$KEY_FILE" \
           --download-url-prefix "$DOWNLOAD_URL_PREFIX" \
@@ -168,17 +177,17 @@ runs:
           --full-release-notes-url "$FULL_RELEASE_NOTES_URL" \
           "$ARCHIVE_DIR"
 
-        dd if=/dev/urandom of="$KEY_FILE" bs=1024 count=4 conv=notrunc 2>/dev/null
-        rm -f "$KEY_FILE"
-        hdiutil detach "$DEV"
-
     - name: repoint old appcast enclosures at their own release tags
       shell: bash
+      env:
+        ARCHIVE_DIR: ${{ inputs.archive-dir }}
+        REPO: ${{ inputs.repo }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
       run: |
         set -euo pipefail
-        npx electron-sparkle-updater fix-appcast "${{ inputs.archive-dir }}/appcast.xml" \
-          --repo "${{ inputs.repo }}" \
-          --tag-prefix "${{ inputs.tag-prefix }}"
+        npx electron-sparkle-updater fix-appcast "$ARCHIVE_DIR/appcast.xml" \
+          --repo "$REPO" \
+          --tag-prefix "$TAG_PREFIX"
 
     - name: publish GitHub Release
       if: ${{ inputs.publish == 'true' }}
