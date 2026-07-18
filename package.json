@@ -15,6 +15,10 @@
     "./builder": {
       "types": "./dist/builder.d.ts",
       "default": "./dist/builder.js"
+    },
+    "./fallback": {
+      "types": "./dist/fallback.d.ts",
+      "default": "./dist/fallback.js"
     }
   },
   "bin": {
