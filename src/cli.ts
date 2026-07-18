@@ -5,8 +5,6 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-export const SPARKLE_VERSION = "2.9.4";
-
 const USAGE = `Usage: electron-sparkle-updater rebuild [--electron-version <v>] [--arch arm64|x64|universal] [--force-fetch]`;
 
 type Arch = "arm64" | "x64" | "universal";
@@ -93,8 +91,9 @@ export interface RunRebuildDeps {
   nativeDir: string;
   spawn: SpawnFn;
   resolveElectronVersion: (cwd: string) => string;
-  removeForceFetchStamp: (nativeDir: string) => void;
+  removeVendorDir: (nativeDir: string) => void;
   copyFile: (src: string, dest: string) => void;
+  removeIntermediate: (path: string) => void;
   log?: (message: string) => void;
   errorLog?: (message: string) => void;
 }
@@ -123,24 +122,27 @@ function runNodeGypRebuild(electronVersion: string, arch: "arm64" | "x64", deps:
 function runUniversalRebuild(electronVersion: string, deps: RunRebuildDeps): number {
   const releaseDir = join(deps.nativeDir, "build", "Release");
   const finalPath = join(releaseDir, "sparkle_bridge.node");
-  const arm64Path = join(releaseDir, "sparkle_bridge.arm64.node");
   const universalPath = join(releaseDir, "sparkle_bridge.universal.node");
+  const arm64IntermediatePath = join(deps.nativeDir, "sparkle_bridge.arm64.node");
 
   const arm64Result = runNodeGypRebuild(electronVersion, "arm64", deps);
   if (arm64Result.status !== 0) {
     return arm64Result.status ?? 1;
   }
-  deps.copyFile(finalPath, arm64Path);
+  deps.copyFile(finalPath, arm64IntermediatePath);
 
   const x64Result = runNodeGypRebuild(electronVersion, "x64", deps);
   if (x64Result.status !== 0) {
+    deps.removeIntermediate(arm64IntermediatePath);
     return x64Result.status ?? 1;
   }
 
-  const lipoResult = deps.spawn("lipo", ["-create", arm64Path, finalPath, "-output", universalPath], {
-    cwd: deps.nativeDir,
-    stdio: "inherit",
-  });
+  const lipoResult = deps.spawn(
+    "lipo",
+    ["-create", arm64IntermediatePath, finalPath, "-output", universalPath],
+    { cwd: deps.nativeDir, stdio: "inherit" },
+  );
+  deps.removeIntermediate(arm64IntermediatePath);
   if (lipoResult.status !== 0) {
     return lipoResult.status ?? 1;
   }
@@ -164,7 +166,7 @@ export function runRebuild(options: RebuildOptions, deps: RunRebuildDeps): numbe
   }
 
   if (options.forceFetch) {
-    deps.removeForceFetchStamp(deps.nativeDir);
+    deps.removeVendorDir(deps.nativeDir);
   }
 
   const fetchResult = deps.spawn("bash", [join(deps.nativeDir, "scripts", "fetch-sparkle.sh")], {
@@ -183,8 +185,8 @@ export function runRebuild(options: RebuildOptions, deps: RunRebuildDeps): numbe
   return rebuildResult.status ?? 1;
 }
 
-function removeForceFetchStamp(nativeDir: string): void {
-  rmSync(join(nativeDir, "vendor", `.sparkle-${SPARKLE_VERSION}.stamp`), { force: true });
+function removeVendorDir(nativeDir: string): void {
+  rmSync(join(nativeDir, "vendor"), { recursive: true, force: true });
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
@@ -205,8 +207,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     nativeDir,
     spawn: (command, args, spawnOptions) => spawnSync(command, args, spawnOptions),
     resolveElectronVersion,
-    removeForceFetchStamp,
+    removeVendorDir,
     copyFile: (src, dest) => copyFileSync(src, dest),
+    removeIntermediate: (path) => rmSync(path, { force: true }),
     log: (message) => console.log(message),
     errorLog: (message) => console.error(message),
   });

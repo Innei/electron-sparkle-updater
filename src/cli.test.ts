@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseCliArgs, resolveElectronVersion, runRebuild, SPARKLE_VERSION } from "./cli.js";
+import { parseCliArgs, resolveElectronVersion, runRebuild } from "./cli.js";
 import type { RunRebuildDeps, SpawnFn, SpawnResult } from "./cli.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -18,8 +18,9 @@ function makeDeps(overrides: Partial<RunRebuildDeps> = {}): RunRebuildDeps {
     nativeDir: "/pkg/native",
     spawn: vi.fn<SpawnFn>().mockReturnValue(ok),
     resolveElectronVersion: vi.fn().mockReturnValue("43.1.0"),
-    removeForceFetchStamp: vi.fn(),
+    removeVendorDir: vi.fn(),
     copyFile: vi.fn(),
+    removeIntermediate: vi.fn(),
     log: vi.fn(),
     errorLog: vi.fn(),
     ...overrides,
@@ -131,7 +132,7 @@ describe("runRebuild", () => {
     const code = runRebuild({ electronVersion: "43.1.0", arch: "arm64", forceFetch: false }, deps);
 
     expect(code).toBe(0);
-    expect(deps.removeForceFetchStamp).not.toHaveBeenCalled();
+    expect(deps.removeVendorDir).not.toHaveBeenCalled();
 
     const spawn = deps.spawn as unknown as ReturnType<typeof vi.fn>;
     expect(spawn).toHaveBeenCalledTimes(2);
@@ -152,15 +153,15 @@ describe("runRebuild", () => {
     expect(gypCall[2]).toMatchObject({ cwd: "/pkg/native", stdio: "inherit" });
   });
 
-  it("removes the stamp before fetching when --force-fetch is passed", () => {
+  it("removes the vendor dir before fetching when --force-fetch is passed", () => {
     const deps = makeDeps();
     runRebuild({ electronVersion: "43.1.0", arch: "arm64", forceFetch: true }, deps);
-    expect(deps.removeForceFetchStamp).toHaveBeenCalledWith("/pkg/native");
+    expect(deps.removeVendorDir).toHaveBeenCalledWith("/pkg/native");
 
-    const removeStampOrder = (deps.removeForceFetchStamp as unknown as ReturnType<typeof vi.fn>).mock
+    const removeVendorOrder = (deps.removeVendorDir as unknown as ReturnType<typeof vi.fn>).mock
       .invocationCallOrder[0];
     const firstSpawnOrder = (deps.spawn as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    expect(removeStampOrder).toBeLessThan(firstSpawnOrder);
+    expect(removeVendorOrder).toBeLessThan(firstSpawnOrder);
   });
 
   it("stops and propagates the exit code when fetch-sparkle.sh fails", () => {
@@ -197,6 +198,29 @@ describe("runRebuild", () => {
     expect(lipoCall[0]).toBe("lipo");
 
     expect(deps.copyFile).toHaveBeenCalledTimes(2);
+
+    const stashArgs = (deps.copyFile as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const arm64IntermediatePath = stashArgs[1] as string;
+    expect(arm64IntermediatePath).not.toMatch(/[/\\]build[/\\]/);
+    expect(arm64IntermediatePath.startsWith("/pkg/native")).toBe(true);
+
+    const lipoArgs = lipoCall[1] as string[];
+    expect(lipoArgs).toContain(arm64IntermediatePath);
+    expect(lipoArgs[0]).toBe("-create");
+
+    // the x64 rebuild runs `rm -rf build/` before recompiling — the arm64
+    // intermediate must live outside native/build/ or node-gyp destroys it
+    expect(x64Call[1]).not.toEqual(expect.arrayContaining([arm64IntermediatePath]));
+  });
+
+  it("cleans up the arm64 intermediate after a successful universal build", () => {
+    const deps = makeDeps();
+    runRebuild({ electronVersion: "43.1.0", arch: "universal", forceFetch: false }, deps);
+
+    const removeIntermediate = deps.removeIntermediate as unknown as ReturnType<typeof vi.fn>;
+    expect(removeIntermediate).toHaveBeenCalledTimes(1);
+    const cleanedPath = removeIntermediate.mock.calls[0][0] as string;
+    expect(cleanedPath).not.toMatch(/[/\\]build[/\\]/);
   });
 
   it("propagates a non-zero lipo exit code for universal builds", () => {
@@ -210,11 +234,5 @@ describe("runRebuild", () => {
     const code = runRebuild({ electronVersion: "43.1.0", arch: "universal", forceFetch: false }, deps);
     expect(code).toBe(5);
     expect(spawn).toHaveBeenCalledTimes(4);
-  });
-});
-
-describe("SPARKLE_VERSION", () => {
-  it("matches the pinned vendor version", () => {
-    expect(SPARKLE_VERSION).toBe("2.9.4");
   });
 });
