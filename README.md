@@ -164,6 +164,8 @@ Spawns Sparkle's own `generate_appcast` binary against `<archive-dir>` with the 
 
 `generate_appcast` stamps every archive it processes — including old zips fetched in only as delta bases — with the current run's `--download-url-prefix`. That leaves older appcast items pointing at the new release tag, where those older assets were never uploaded (404). Enclosure URLs aren't covered by the EdDSA signatures (those sign file contents, not URLs), so rewriting each one back to the tag its own version was actually published under is safe. This runs automatically inside `generate-appcast --repo`, or standalone:
 
+This re-pointing assumes stable `x.y.z` release tags — prerelease suffixes (`-beta.1` and similar) and archive filenames whose first numeric triplet isn't the actual version will get matched to the wrong tag and repoint incorrectly.
+
 ```
 electron-sparkle-updater fix-appcast <appcast-dir>/appcast.xml --repo <owner/repo> [--tag-prefix <string>]
 ```
@@ -187,10 +189,13 @@ jobs:
           tag: ${{ github.ref_name }}
           archive-dir: dist/release
           ed-private-key: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          fetch-delta-bases: "false"
       - run: gh release create "${{ github.ref_name }}" --draft dist/release/*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+`fetch-delta-bases` is set to `"false"` here because the default (`"true"`) has the Action download previous releases' zips into `archive-dir` as delta bases — with that default, a plain `dist/release/*` glob on the publish step would re-upload those stale prior-release zips alongside the new build. If you need delta updates in a generate-only flow, leave `fetch-delta-bases` at its default and enumerate this release's own assets explicitly instead of globbing the archive directory (e.g. list the known output filenames, or filter by the current tag).
 
 Generate and publish in one step (`publish: true`):
 
