@@ -1,0 +1,55 @@
+{
+  "name": "electron-sparkle-updater",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Sparkle-based auto-updates for Electron apps on macOS.",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./builder": {
+      "types": "./dist/builder.d.ts",
+      "default": "./dist/builder.js"
+    }
+  },
+  "bin": {
+    "electron-sparkle-updater": "./bin/electron-sparkle-updater.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "native/src",
+    "native/binding.gyp",
+    "native/scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "install": "node -e \"\"",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "electron": ">=28"
+  },
+  "peerDependenciesMeta": {
+    "electron": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "node-addon-api": "^8"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "node-gyp": "^13",
+    "typescript": "^5",
+    "vitest": "^3"
+  }
+}
