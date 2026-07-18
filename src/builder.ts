@@ -18,7 +18,8 @@ export function sparkleBuilderConfig(options: SparkleBuilderConfigOptions) {
         to: "Frameworks/Sparkle.framework",
       },
     ],
-    asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/**"],
+    files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**"],
+    asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/Release/*.node"],
     dmg: { writeUpdateInfo: false },
     zip: { writeUpdateInfo: false },
     mac: {

@@ -19,7 +19,8 @@ describe("sparkleBuilderConfig", () => {
           to: "Frameworks/Sparkle.framework",
         },
       ],
-      asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/**"],
+      files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**"],
+      asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/Release/*.node"],
       dmg: { writeUpdateInfo: false },
       zip: { writeUpdateInfo: false },
       mac: {
@@ -41,6 +42,28 @@ describe("sparkleBuilderConfig", () => {
     });
     expect(config.mac.extendInfo.SUPublicEDKey).toBe("abc123");
     expect(config.mac.extendInfo.SUScheduledCheckInterval).toBe(1800);
+  });
+
+  it("excludes native/vendor from the consumer's asar (no second Sparkle.framework copy)", () => {
+    const config = sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" });
+    expect(config.files).toContain("!**/node_modules/electron-sparkle-updater/native/vendor/**");
+  });
+
+  it("narrows asarUnpack to exactly the .node file the packaged loader expects", () => {
+    const config = sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" });
+    const addonDir = "node_modules/electron-sparkle-updater/native/build/Release";
+
+    const unpackGlobs = config.asarUnpack as string[];
+    expect(unpackGlobs).toEqual([`**/${addonDir}/*.node`]);
+
+    const [glob] = unpackGlobs;
+    const prefix = glob.slice(0, glob.indexOf("*"));
+    const addonPath = `${addonDir}/sparkle_bridge.node`;
+    expect(`**/${addonPath}`.startsWith(prefix)).toBe(true);
+    expect(addonPath.endsWith(".node")).toBe(true);
+
+    expect(glob).not.toContain("build/**");
+    expect(glob).not.toContain("Makefile");
   });
 });
 
