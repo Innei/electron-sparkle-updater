@@ -44,11 +44,11 @@
     }
   },
   "dependencies": {
-    "node-addon-api": "^8"
+    "node-addon-api": "^8",
+    "node-gyp": "^13"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "node-gyp": "^13",
     "typescript": "^5",
     "vitest": "^3"
   }

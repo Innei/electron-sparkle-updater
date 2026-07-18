@@ -141,9 +141,9 @@ describe("runRebuild", () => {
     expect(fetchCall[1]).toEqual([join("/pkg/native", "scripts", "fetch-sparkle.sh")]);
     expect(fetchCall[2]).toMatchObject({ cwd: "/pkg/native", stdio: "inherit" });
 
-    expect(gypCall[0]).toBe("npx");
-    expect(gypCall[1]).toEqual([
-      "node-gyp",
+    expect(gypCall[0]).toBe(process.execPath);
+    expect(gypCall[1][0]).toMatch(/node-gyp[/\\]bin[/\\]node-gyp\.js$/);
+    expect(gypCall[1].slice(1)).toEqual([
       "rebuild",
       "--target=43.1.0",
       "--arch=arm64",

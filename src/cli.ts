@@ -99,10 +99,23 @@ export interface RunRebuildDeps {
   errorLog?: (message: string) => void;
 }
 
+function resolveNodeGypBin(): string {
+  const require = createRequire(import.meta.url);
+  const nodeGypPackage = require("node-gyp/package.json") as { bin: string | Record<string, string> };
+  const binPath = typeof nodeGypPackage.bin === "string" ? nodeGypPackage.bin : nodeGypPackage.bin["node-gyp"];
+  return require.resolve(join("node-gyp", binPath));
+}
+
 function runNodeGypRebuild(electronVersion: string, arch: "arm64" | "x64", deps: RunRebuildDeps): SpawnResult {
   return deps.spawn(
-    "npx",
-    ["node-gyp", "rebuild", `--target=${electronVersion}`, `--arch=${arch}`, "--dist-url=https://electronjs.org/headers"],
+    process.execPath,
+    [
+      resolveNodeGypBin(),
+      "rebuild",
+      `--target=${electronVersion}`,
+      `--arch=${arch}`,
+      "--dist-url=https://electronjs.org/headers",
+    ],
     { cwd: deps.nativeDir, stdio: "inherit" },
   );
 }

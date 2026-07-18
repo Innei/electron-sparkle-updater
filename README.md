@@ -13,3 +13,7 @@ npm install electron-sparkle-updater
 ### Why `install` is a no-op
 
 This package ships a `binding.gyp` for its native Sparkle bridge. npm auto-runs `node-gyp rebuild` for any package containing a `binding.gyp`, built against the host Node ABI — the wrong target, since this addon must run inside Electron's ABI instead. The `install` script is therefore a deliberate no-op (`node -e ""`); the real build is the explicit `electron-sparkle-updater rebuild` command, run against the Electron version you actually ship.
+
+## Build
+
+`--arch universal` builds arm64 and x64 separately, then `lipo`-combines them into one binary.
