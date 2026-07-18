@@ -20,7 +20,6 @@
           "-framework Sparkle",
           "-Wl,-rpath,@loader_path/../../vendor",
           "-Wl,-rpath,@loader_path/../../../../../../Frameworks",
-          "-Wl,-rpath,@loader_path/../../../../../../../../Frameworks",
           "-Wl,-rpath,@loader_path/../../../../../../../../Frameworks"
         ]
       }

@@ -98,7 +98,7 @@ export default {
 };
 ```
 
-If you configure electron-builder with YAML instead, copy the individual keys `sparkleBuilderConfig` returns (`extraFiles`, `asarUnpack`, `dmg.writeUpdateInfo`, `zip.writeUpdateInfo`, `mac.extendInfo`) into your `electron-builder.yml` by hand — YAML can't `...spread` a JS object.
+If you configure electron-builder with YAML instead, copy the individual keys `sparkleBuilderConfig` returns (`extraFiles`, `asarUnpack`, `dmg.writeUpdateInfo`, `zip.writeUpdateInfo`, `mac.extendInfo`, `files`) into your `electron-builder.yml` by hand — YAML can't `...spread` a JS object. If your electron-builder config already defines a `files` array, concatenate the fragment's `files` entries into it rather than letting a spread overwrite them.
 
 When `publicEdKey` is omitted, the config carries the exported constant `SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER` (`"SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER"`) in `mac.extendInfo.SUPublicEDKey` — a greppable anchor your release pipeline can search-and-replace with the real key at build time, instead of committing the key to source.
 
