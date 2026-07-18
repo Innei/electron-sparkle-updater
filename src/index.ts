@@ -84,9 +84,16 @@ export async function loadSparkleBridgeForApp(log?: (message: string) => void): 
     return null;
   }
 
-  const { app } = (await import("electron")) as unknown as ElectronModule;
+  let electronModule: ElectronModule;
+  try {
+    electronModule = (await import("electron")) as unknown as ElectronModule;
+  } catch (err) {
+    log?.(`electron import failed: ${(err as Error).message}`);
+    return null;
+  }
+
   return loadSparkleBridge({
-    isPackaged: app.isPackaged,
+    isPackaged: electronModule.app.isPackaged,
     resourcesPath: process.resourcesPath,
     log,
   });

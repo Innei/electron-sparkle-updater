@@ -17,6 +17,7 @@ beforeEach(() => {
 
 afterEach(() => {
   Object.defineProperty(process, "platform", { value: originalPlatform });
+  delete (process as { resourcesPath?: string }).resourcesPath;
   vi.restoreAllMocks();
   vi.resetModules();
 });
@@ -109,6 +110,28 @@ describe("loadSparkleBridge", () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toMatch(/missing expected exports/);
   });
+
+  it("infers the addon path from the package root when addonPath is omitted", () => {
+    stubPlatform("darwin");
+    const log = vi.fn();
+    const result = loadSparkleBridge({
+      isPackaged: false,
+      resourcesPath: "/unused",
+      log,
+    });
+
+    const expectedPath = join(here, "..", "native", "build", "Release", "sparkle_bridge.node");
+
+    if (result) {
+      expect(typeof result.init).toBe("function");
+      expect(typeof result.checkForUpdates).toBe("function");
+      expect(typeof result.installUpdateNow).toBe("function");
+      expect(typeof result.setAutomaticChecks).toBe("function");
+    } else {
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toContain(expectedPath);
+    }
+  });
 });
 
 describe("loadSparkleBridgeForApp", () => {
@@ -122,10 +145,15 @@ describe("loadSparkleBridgeForApp", () => {
     stubPlatform("darwin");
     vi.doMock("electron", () => ({ app: { isPackaged: true } }));
     Object.defineProperty(process, "resourcesPath", { value: "/res", configurable: true });
+    const log = vi.fn();
 
     const { loadSparkleBridgeForApp: freshLoadSparkleBridgeForApp } = await import("./index.js");
-    const result = await freshLoadSparkleBridgeForApp();
+    const result = await freshLoadSparkleBridgeForApp(log);
 
     expect(result).toBeNull();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain(
+      join("/res", "app.asar.unpacked", "node_modules", "electron-sparkle-updater"),
+    );
   });
 });
