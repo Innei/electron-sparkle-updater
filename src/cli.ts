@@ -1,4 +1,4 @@
-import { copyFileSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
@@ -10,7 +10,8 @@ import { SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER } from "./builder.js";
 const USAGE = `Usage:
   electron-sparkle-updater rebuild [--electron-version <v>] [--arch arm64|x64|universal] [--force-fetch]
   electron-sparkle-updater inject-public-key --file <path> --key <value> [--placeholder <string>]
-  electron-sparkle-updater fix-appcast <appcast.xml> --repo <owner/repo> [--tag-prefix <string>]`;
+  electron-sparkle-updater fix-appcast <appcast.xml> --repo <owner/repo> [--tag-prefix <string>]
+  electron-sparkle-updater generate-appcast <archive-dir> --ed-key-file <path> --download-url-prefix <url> [--embed-release-notes] [--full-release-notes-url <url>] [--repo <owner/repo>] [--tag-prefix <string>] [--sparkle-bin <dir>]`;
 
 type Arch = "arm64" | "x64" | "universal";
 
@@ -32,10 +33,22 @@ export interface FixAppcastOptions {
   tagPrefix: string;
 }
 
+export interface GenerateAppcastOptions {
+  archiveDir: string;
+  edKeyFile: string;
+  downloadUrlPrefix: string;
+  embedReleaseNotes: boolean;
+  fullReleaseNotesUrl?: string;
+  repo?: string;
+  tagPrefix: string;
+  sparkleBin?: string;
+}
+
 export type ParsedCommand =
   | { kind: "rebuild"; options: RebuildOptions }
   | { kind: "inject-public-key"; options: InjectPublicKeyOptions }
   | { kind: "fix-appcast"; options: FixAppcastOptions }
+  | { kind: "generate-appcast"; options: GenerateAppcastOptions }
   | { kind: "usage"; exitCode: number; message?: string };
 
 function isArch(value: string): value is Arch {
@@ -141,6 +154,58 @@ function parseFixAppcastArgs(rest: string[]): ParsedCommand {
   };
 }
 
+function parseGenerateAppcastArgs(rest: string[]): ParsedCommand {
+  let values: { [key: string]: string | boolean | undefined };
+  let positionals: string[];
+  try {
+    ({ values, positionals } = parseArgs({
+      args: rest,
+      options: {
+        "ed-key-file": { type: "string" },
+        "download-url-prefix": { type: "string" },
+        "embed-release-notes": { type: "boolean", default: false },
+        "full-release-notes-url": { type: "string" },
+        repo: { type: "string" },
+        "tag-prefix": { type: "string" },
+        "sparkle-bin": { type: "string" },
+      },
+      allowPositionals: true,
+      strict: true,
+    }));
+  } catch (err) {
+    return { kind: "usage", exitCode: 1, message: (err as Error).message };
+  }
+
+  const archiveDir = positionals[0];
+  if (!archiveDir) {
+    return { kind: "usage", exitCode: 1, message: "archive-dir is required" };
+  }
+
+  const edKeyFile = values["ed-key-file"] as string | undefined;
+  if (!edKeyFile) {
+    return { kind: "usage", exitCode: 1, message: "--ed-key-file is required" };
+  }
+
+  const downloadUrlPrefix = values["download-url-prefix"] as string | undefined;
+  if (!downloadUrlPrefix) {
+    return { kind: "usage", exitCode: 1, message: "--download-url-prefix is required" };
+  }
+
+  return {
+    kind: "generate-appcast",
+    options: {
+      archiveDir,
+      edKeyFile,
+      downloadUrlPrefix,
+      embedReleaseNotes: Boolean(values["embed-release-notes"]),
+      fullReleaseNotesUrl: values["full-release-notes-url"] as string | undefined,
+      repo: values.repo as string | undefined,
+      tagPrefix: (values["tag-prefix"] as string | undefined) ?? "v",
+      sparkleBin: values["sparkle-bin"] as string | undefined,
+    },
+  };
+}
+
 export function parseCliArgs(argv: string[]): ParsedCommand {
   const [command, ...rest] = argv;
   switch (command) {
@@ -150,6 +215,8 @@ export function parseCliArgs(argv: string[]): ParsedCommand {
       return parseInjectPublicKeyArgs(rest);
     case "fix-appcast":
       return parseFixAppcastArgs(rest);
+    case "generate-appcast":
+      return parseGenerateAppcastArgs(rest);
     default:
       return {
         kind: "usage",
@@ -325,6 +392,49 @@ export function runFixAppcast(options: FixAppcastOptions, deps: FileSystemDeps):
   return 0;
 }
 
+export interface RunGenerateAppcastDeps extends FileSystemDeps {
+  cwd: string;
+  spawn: SpawnFn;
+  defaultSparkleBin: string;
+  fileExists: (path: string) => boolean;
+}
+
+export function runGenerateAppcast(options: GenerateAppcastOptions, deps: RunGenerateAppcastDeps): number {
+  const sparkleBinDir = options.sparkleBin ?? deps.defaultSparkleBin;
+  const generateAppcastBin = join(sparkleBinDir, "generate_appcast");
+
+  if (!deps.fileExists(generateAppcastBin)) {
+    deps.errorLog?.(
+      `generate_appcast not found at ${generateAppcastBin}; run \`electron-sparkle-updater rebuild\` or \`native/scripts/fetch-sparkle.sh\` to fetch Sparkle's tools`,
+    );
+    return 1;
+  }
+
+  const args = ["--ed-key-file", options.edKeyFile, "--download-url-prefix", options.downloadUrlPrefix];
+  if (options.embedReleaseNotes) {
+    args.push("--embed-release-notes");
+  }
+  if (options.fullReleaseNotesUrl) {
+    args.push("--full-release-notes-url", options.fullReleaseNotesUrl);
+  }
+  args.push(options.archiveDir);
+
+  const result = deps.spawn(generateAppcastBin, args, { cwd: deps.cwd, stdio: "inherit" });
+  if (result.status !== 0) {
+    return result.status ?? 1;
+  }
+
+  if (options.repo) {
+    const appcastPath = join(options.archiveDir, "appcast.xml");
+    const xml = deps.readFile(appcastPath);
+    const fixed = fixAppcastEnclosureUrls(xml, options.repo, options.tagPrefix);
+    deps.writeFile(appcastPath, fixed.xml);
+    deps.log?.(`${fixed.rewrites} enclosure URL(s) rewritten in ${appcastPath}`);
+  }
+
+  return 0;
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const parsed = parseCliArgs(argv);
   if (parsed.kind === "usage") {
@@ -351,6 +461,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 
   const nativeDir = join(dirname(fileURLToPath(import.meta.url)), "..", "native");
+
+  if (parsed.kind === "generate-appcast") {
+    return runGenerateAppcast(parsed.options, {
+      ...fileSystemDeps,
+      cwd: process.cwd(),
+      spawn: (command, args, spawnOptions) => spawnSync(command, args, spawnOptions),
+      defaultSparkleBin: join(nativeDir, "vendor", "bin"),
+      fileExists: (path) => existsSync(path),
+    });
+  }
 
   return runRebuild(parsed.options, {
     platform: process.platform,

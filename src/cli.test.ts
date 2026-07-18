@@ -3,9 +3,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseCliArgs, resolveElectronVersion, runFixAppcast, runInjectPublicKey, runRebuild } from "./cli.js";
+import {
+  parseCliArgs,
+  resolveElectronVersion,
+  runFixAppcast,
+  runGenerateAppcast,
+  runInjectPublicKey,
+  runRebuild,
+} from "./cli.js";
 import type {
   FileSystemDeps,
+  RunGenerateAppcastDeps,
   RunInjectPublicKeyDeps,
   RunRebuildDeps,
   SpawnFn,
@@ -150,6 +158,262 @@ describe("parseCliArgs fix-appcast", () => {
   it("rejects a missing --repo", () => {
     const result = parseCliArgs(["fix-appcast", "appcast.xml"]);
     expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+});
+
+describe("parseCliArgs generate-appcast", () => {
+  it("parses required flags and defaults tag-prefix, embed-release-notes and sparkle-bin", () => {
+    const result = parseCliArgs([
+      "generate-appcast",
+      "archives",
+      "--ed-key-file",
+      "key.pem",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+    ]);
+    expect(result).toEqual({
+      kind: "generate-appcast",
+      options: {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        fullReleaseNotesUrl: undefined,
+        repo: undefined,
+        tagPrefix: "v",
+        sparkleBin: undefined,
+      },
+    });
+  });
+
+  it("parses every optional flag", () => {
+    const result = parseCliArgs([
+      "generate-appcast",
+      "archives",
+      "--ed-key-file",
+      "key.pem",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+      "--embed-release-notes",
+      "--full-release-notes-url",
+      "https://example.com/notes",
+      "--repo",
+      "owner/repo",
+      "--tag-prefix",
+      "desktop-v",
+      "--sparkle-bin",
+      "/custom/bin",
+    ]);
+    expect(result).toEqual({
+      kind: "generate-appcast",
+      options: {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: true,
+        fullReleaseNotesUrl: "https://example.com/notes",
+        repo: "owner/repo",
+        tagPrefix: "desktop-v",
+        sparkleBin: "/custom/bin",
+      },
+    });
+  });
+
+  it("rejects a missing archive-dir positional", () => {
+    const result = parseCliArgs([
+      "generate-appcast",
+      "--ed-key-file",
+      "key.pem",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+    ]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+
+  it("rejects a missing --ed-key-file", () => {
+    const result = parseCliArgs([
+      "generate-appcast",
+      "archives",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+    ]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+
+  it("rejects a missing --download-url-prefix", () => {
+    const result = parseCliArgs(["generate-appcast", "archives", "--ed-key-file", "key.pem"]);
+    expect(result).toMatchObject({ kind: "usage", exitCode: 1 });
+  });
+});
+
+describe("runGenerateAppcast", () => {
+  const ok: SpawnResult = { status: 0 };
+
+  function makeDeps(overrides: Partial<RunGenerateAppcastDeps> = {}): RunGenerateAppcastDeps {
+    return {
+      cwd: "/consumer",
+      defaultSparkleBin: "/pkg/native/vendor/bin",
+      spawn: vi.fn<SpawnFn>().mockReturnValue(ok),
+      fileExists: vi.fn().mockReturnValue(true),
+      readFile: vi.fn().mockReturnValue('<enclosure url="x" />'),
+      writeFile: vi.fn(),
+      log: vi.fn(),
+      errorLog: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("spawns generate_appcast from the default sparkle-bin dir with the required flags", () => {
+    const deps = makeDeps();
+    const code = runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(deps.fileExists).toHaveBeenCalledWith(join("/pkg/native/vendor/bin", "generate_appcast"));
+
+    const spawn = deps.spawn as unknown as ReturnType<typeof vi.fn>;
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [command, args, options] = spawn.mock.calls[0];
+    expect(command).toBe(join("/pkg/native/vendor/bin", "generate_appcast"));
+    expect(args).toEqual([
+      "--ed-key-file",
+      "key.pem",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+      "archives",
+    ]);
+    expect(options).toMatchObject({ stdio: "inherit" });
+  });
+
+  it("includes --embed-release-notes and --full-release-notes-url when given", () => {
+    const deps = makeDeps();
+    runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: true,
+        fullReleaseNotesUrl: "https://example.com/notes",
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    const spawn = deps.spawn as unknown as ReturnType<typeof vi.fn>;
+    expect(spawn.mock.calls[0][1]).toEqual([
+      "--ed-key-file",
+      "key.pem",
+      "--download-url-prefix",
+      "https://example.com/dl/",
+      "--embed-release-notes",
+      "--full-release-notes-url",
+      "https://example.com/notes",
+      "archives",
+    ]);
+  });
+
+  it("uses --sparkle-bin override instead of the default", () => {
+    const deps = makeDeps();
+    runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        tagPrefix: "v",
+        sparkleBin: "/custom/bin",
+      },
+      deps,
+    );
+    expect(deps.fileExists).toHaveBeenCalledWith(join("/custom/bin", "generate_appcast"));
+    const spawn = deps.spawn as unknown as ReturnType<typeof vi.fn>;
+    expect(spawn.mock.calls[0][0]).toBe(join("/custom/bin", "generate_appcast"));
+  });
+
+  it("errors with a hint to rebuild or fetch-sparkle.sh when generate_appcast is missing, without spawning", () => {
+    const deps = makeDeps({ fileExists: vi.fn().mockReturnValue(false) });
+    const code = runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    expect(code).toBe(1);
+    expect(deps.spawn).not.toHaveBeenCalled();
+    expect(deps.errorLog).toHaveBeenCalledWith(expect.stringMatching(/rebuild/));
+    expect(deps.errorLog).toHaveBeenCalledWith(expect.stringMatching(/fetch-sparkle\.sh/));
+  });
+
+  it("propagates a non-zero exit code from generate_appcast without touching the appcast", () => {
+    const spawn = vi.fn<SpawnFn>().mockReturnValue({ status: 4 });
+    const deps = makeDeps({ spawn });
+    const code = runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        repo: "owner/repo",
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    expect(code).toBe(4);
+    expect(deps.readFile).not.toHaveBeenCalled();
+    expect(deps.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("does not run fix-appcast when --repo is omitted", () => {
+    const deps = makeDeps();
+    const code = runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(deps.readFile).not.toHaveBeenCalled();
+    expect(deps.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("runs fix-appcast on <archive-dir>/appcast.xml when --repo is given and the spawn succeeds", () => {
+    const deps = makeDeps({
+      readFile: vi
+        .fn()
+        .mockReturnValue('<enclosure url="https://github.com/owner/repo/releases/download/vOLD/App-1.2.3.zip" />'),
+    });
+    const code = runGenerateAppcast(
+      {
+        archiveDir: "archives",
+        edKeyFile: "key.pem",
+        downloadUrlPrefix: "https://example.com/dl/",
+        embedReleaseNotes: false,
+        repo: "owner/repo",
+        tagPrefix: "v",
+      },
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(deps.readFile).toHaveBeenCalledWith(join("archives", "appcast.xml"));
+    expect(deps.writeFile).toHaveBeenCalledWith(
+      join("archives", "appcast.xml"),
+      expect.stringContaining("v1.2.3/App-1.2.3.zip"),
+    );
+    expect(deps.log).toHaveBeenCalledWith(expect.stringMatching(/1 enclosure URL/));
   });
 });
 
