@@ -19,6 +19,8 @@ In:
 - electron-builder integration (`./builder`): config fragments (Frameworks extraFiles, asarUnpack, `SUFeedURL`/`SUPublicEDKey` extendInfo placeholder convention, blockmap opt-out) and an afterPack ad-hoc signing hook.
 - Release toolchain: CLI wrapping Sparkle's `generate_appcast` (delta-base fetching, embedded release notes, enclosure URL re-pointing to per-tag release assets) and a reusable composite GitHub Action (fetch Sparkle tools, RAM-disk private-key signing, publish).
 
+Platform positioning: this library solves a macOS-specific pain (Squirrel.Mac requires a paid signing identity; Sparkle works with ad-hoc signing). On Windows/Linux the ecosystem answer is already good — `electron-updater` (NSIS with differential updates; AppImage) or store channels (MSIX/winget, Snap/Flatpak) — so the recommended combination is "this library on macOS, electron-updater elsewhere". `./fallback` is the minimal notify-only option for apps that don't want electron-updater or ship formats without in-app update (bare zip, deb). This goes in the README.
+
 Out:
 
 - A native Windows bridge (WinSparkle) — future direction, documented in the README, not built now.
