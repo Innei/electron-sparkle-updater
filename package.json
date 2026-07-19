@@ -1,6 +1,6 @@
 {
   "name": "electron-sparkle-updater",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "description": "Sparkle-based auto-updates for Electron apps on macOS.",
