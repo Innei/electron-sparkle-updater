@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   adHocSignAfterPack,
   sparkleBuilderConfig,
+  sparkleLocalizations,
   SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
 } from "./builder.js";
 import type { ExecFileFn } from "./builder.js";
@@ -29,6 +30,7 @@ describe("sparkleBuilderConfig", () => {
           SUPublicEDKey: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
           SUEnableInstallerLauncherService: false,
           SUScheduledCheckInterval: 3600,
+          CFBundleLocalizations: sparkleLocalizations(),
         },
       },
     });
@@ -47,6 +49,41 @@ describe("sparkleBuilderConfig", () => {
   it("excludes native/vendor from the consumer's asar (no second Sparkle.framework copy)", () => {
     const config = sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" });
     expect(config.files).toContain("!**/node_modules/electron-sparkle-updater/native/vendor/**");
+  });
+
+  it("declares Sparkle's shipped localizations so its UI can follow the system language", () => {
+    const readdir = vi.fn(() => ["Base.lproj", "de.lproj", "zh_CN.lproj", "SUStatus.nib"]);
+    const config = sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" }, { readdir });
+    expect(config.mac.extendInfo.CFBundleLocalizations).toEqual(["de", "zh_CN"]);
+  });
+
+  it("enumerates the vendored framework's real .lproj set", () => {
+    const localizations = sparkleLocalizations();
+    expect(localizations).toContain("de");
+    expect(localizations).toContain("zh_CN");
+    expect(localizations).not.toContain("Base");
+    expect(localizations.length).toBeGreaterThan(30);
+  });
+
+  it("prefers explicit localizations over enumeration", () => {
+    const readdir = vi.fn(() => {
+      throw new Error("should not be called");
+    });
+    const config = sparkleBuilderConfig(
+      { feedUrl: "https://example.com/appcast.xml", localizations: ["en", "zh_CN"] },
+      { readdir },
+    );
+    expect(config.mac.extendInfo.CFBundleLocalizations).toEqual(["en", "zh_CN"]);
+    expect(readdir).not.toHaveBeenCalled();
+  });
+
+  it("throws a rebuild hint when the vendored framework is missing", () => {
+    const readdir = vi.fn(() => {
+      throw new Error("ENOENT");
+    });
+    expect(() => sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" }, { readdir })).toThrow(
+      /electron-sparkle-updater rebuild/,
+    );
   });
 
   it("narrows asarUnpack to exactly the .node file the packaged loader expects", () => {

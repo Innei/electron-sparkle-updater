@@ -1,16 +1,50 @@
 import { execFileSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER = "SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER";
+
+const SPARKLE_RESOURCES_DIR = fileURLToPath(
+  new URL("../native/vendor/Sparkle.framework/Resources", import.meta.url),
+);
+
+export type ReaddirFn = (path: string) => string[];
+
+export interface SparkleLocalizationsDeps {
+  readdir?: ReaddirFn;
+}
+
+// macOS restricts an embedded framework's localizations to the languages the
+// host app itself declares (CFBundleLocalizations or .lproj folders), so
+// Sparkle's 36 translations stay dormant unless the Electron app claims them.
+export function sparkleLocalizations(deps: SparkleLocalizationsDeps = {}): string[] {
+  const readdir = deps.readdir ?? ((path: string) => readdirSync(path));
+  let entries: string[];
+  try {
+    entries = readdir(SPARKLE_RESOURCES_DIR);
+  } catch {
+    throw new Error(
+      `Sparkle.framework resources not found at ${SPARKLE_RESOURCES_DIR} — run \`electron-sparkle-updater rebuild\` before packaging, or pass \`localizations\` explicitly`,
+    );
+  }
+  return entries
+    .filter((entry) => entry.endsWith(".lproj") && entry !== "Base.lproj")
+    .map((entry) => entry.slice(0, -".lproj".length))
+    .sort();
+}
 
 export interface SparkleBuilderConfigOptions {
   feedUrl: string;
   publicEdKey?: string;
   scheduledCheckIntervalSeconds?: number;
+  localizations?: string[];
 }
 
-export function sparkleBuilderConfig(options: SparkleBuilderConfigOptions) {
+export function sparkleBuilderConfig(
+  options: SparkleBuilderConfigOptions,
+  deps: SparkleLocalizationsDeps = {},
+) {
   return {
     extraFiles: [
       {
@@ -28,6 +62,7 @@ export function sparkleBuilderConfig(options: SparkleBuilderConfigOptions) {
         SUPublicEDKey: options.publicEdKey ?? SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
         SUEnableInstallerLauncherService: false,
         SUScheduledCheckInterval: options.scheduledCheckIntervalSeconds ?? 3600,
+        CFBundleLocalizations: options.localizations ?? sparkleLocalizations(deps),
       },
     },
   };
