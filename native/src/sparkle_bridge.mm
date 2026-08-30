@@ -1,16 +1,53 @@
 #import <Foundation/Foundation.h>
 #import <Sparkle/Sparkle.h>
+#include <atomic>
 #include <napi.h>
+#include <string>
 
-// Sparkle needs SPUUpdaterDelegate to observe a check cycle finishing/aborting; we log
-// through it purely for diagnostics (no NSAlert or unified-log line is otherwise
-// guaranteed for a headless run in a sandbox with no attached display).
+static Napi::ThreadSafeFunction g_eventTsfn;
+static std::atomic<bool> g_hasEventHandler{false};
+
+static void EmitSparkleEvent(NSDictionary *payload) {
+  if (!g_hasEventHandler.load() || payload == nil) return;
+  if (![NSJSONSerialization isValidJSONObject:payload]) return;
+
+  NSError *error = nil;
+  NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&error];
+  if (data == nil || data.length == 0) return;
+
+  auto *json = new std::string(static_cast<const char *>(data.bytes), data.length);
+  napi_status status = g_eventTsfn.NonBlockingCall(
+      json, [](Napi::Env env, Napi::Function jsCallback, std::string *json) {
+        Napi::Value parsed = env.Global()
+                                 .Get("JSON")
+                                 .As<Napi::Object>()
+                                 .Get("parse")
+                                 .As<Napi::Function>()
+                                 .Call({Napi::String::New(env, *json)});
+        jsCallback.Call({parsed});
+        delete json;
+      });
+  if (status != napi_ok) delete json;
+}
+
+static NSString *ISO8601String(NSDate *date) {
+  if (date == nil) return nil;
+  static NSISO8601DateFormatter *formatter;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    formatter = [[NSISO8601DateFormatter alloc] init];
+  });
+  return [formatter stringFromDate:date];
+}
+
 @interface SparkleBridgeLogDelegate : NSObject <SPUUpdaterDelegate>
 @end
 
 @implementation SparkleBridgeLogDelegate
 
-- (void)updater:(SPUUpdater *)updater didFinishUpdateCycleForUpdateCheck:(SPUUpdateCheck)updateCheck error:(nullable NSError *)error {
+- (void)updater:(SPUUpdater *)updater
+    didFinishUpdateCycleForUpdateCheck:(SPUUpdateCheck)updateCheck
+                                 error:(nullable NSError *)error {
   if (error != nil) {
     NSLog(@"[sparkle-bridge] update cycle finished with error: %@", error);
   } else {
@@ -24,102 +61,145 @@
 
 @end
 
-// Forwards all UI to SPUStandardUserDriver, except optionally auto-accepting
-// "update found" so titlebar install skips the confirm dialog.
-@interface AutoAcceptUserDriver : NSObject <SPUUserDriver>
-@property (nonatomic, strong) id<SPUUserDriver> inner;
-@property (nonatomic, assign) BOOL autoAcceptFoundUpdate;
+// Electron owns the progress/install UI. This driver auto-replies to Sparkle
+// and never presents SPUStandardUserDriver alerts.
+@interface SilentUserDriver : NSObject <SPUUserDriver>
+@property(nonatomic, copy, nullable) void (^readyToInstallReply)(SPUUserUpdateChoice);
+@property(nonatomic, assign) uint64_t expectedContentLength;
+@property(nonatomic, assign) uint64_t receivedLength;
+@property(nonatomic, assign) BOOL installWhenReady;
+@property(nonatomic, copy, nullable) NSString *updateVersion;
 @end
 
-@implementation AutoAcceptUserDriver
+@implementation SilentUserDriver
 
-- (instancetype)initWithInner:(id<SPUUserDriver>)inner {
-  self = [super init];
-  if (self) {
-    _inner = inner;
-    _autoAcceptFoundUpdate = NO;
-  }
-  return self;
-}
-
-- (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request reply:(void (^)(SUUpdatePermissionResponse *))reply {
-  [self.inner showUpdatePermissionRequest:request reply:reply];
+- (void)showUpdatePermissionRequest:(SPUUpdatePermissionRequest *)request
+                              reply:(void (^)(SUUpdatePermissionResponse *))reply {
+  reply([[SUUpdatePermissionResponse alloc] initWithAutomaticUpdateChecks:YES sendSystemProfile:NO]);
 }
 
 - (void)showUserInitiatedUpdateCheckWithCancellation:(void (^)(void))cancellation {
-  [self.inner showUserInitiatedUpdateCheckWithCancellation:cancellation];
+  EmitSparkleEvent(@{@"type" : @"checking"});
 }
 
-- (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)appcastItem state:(SPUUserUpdateState *)state reply:(void (^)(SPUUserUpdateChoice))reply {
-  if (self.autoAcceptFoundUpdate && !appcastItem.informationOnlyUpdate) {
-    NSLog(@"[sparkle-bridge] auto-accepting found update (install now path)");
-    self.autoAcceptFoundUpdate = NO;
-    reply(SPUUserUpdateChoiceInstall);
+- (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)appcastItem
+                                 state:(SPUUserUpdateState *)state
+                                 reply:(void (^)(SPUUserUpdateChoice))reply {
+  if (appcastItem.informationOnlyUpdate) {
+    self.installWhenReady = NO;
+    EmitSparkleEvent(@{@"type" : @"error", @"message" : @"informational update"});
+    reply(SPUUserUpdateChoiceDismiss);
     return;
   }
-  self.autoAcceptFoundUpdate = NO;
-  [self.inner showUpdateFoundWithAppcastItem:appcastItem state:state reply:reply];
+
+  NSString *version = appcastItem.displayVersionString.length > 0
+                          ? appcastItem.displayVersionString
+                          : appcastItem.versionString;
+  self.updateVersion = version;
+
+  BOOL alreadyInstalling = state.stage == SPUUserUpdateStageInstalling && !self.installWhenReady;
+  NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+  payload[@"type"] = alreadyInstalling ? @"update-downloaded" : @"update-available";
+  if (version.length > 0) payload[@"version"] = version;
+  if (appcastItem.title.length > 0) payload[@"releaseName"] = appcastItem.title;
+  NSString *releaseDate = ISO8601String(appcastItem.date);
+  if (releaseDate.length > 0) payload[@"releaseDate"] = releaseDate;
+  if (appcastItem.itemDescription.length > 0) payload[@"releaseNotes"] = appcastItem.itemDescription;
+  EmitSparkleEvent(payload);
+
+  if (alreadyInstalling) {
+    reply(SPUUserUpdateChoiceDismiss);
+    return;
+  }
+  reply(SPUUserUpdateChoiceInstall);
 }
 
 - (void)showUpdateReleaseNotesWithDownloadData:(SPUDownloadData *)downloadData {
-  [self.inner showUpdateReleaseNotesWithDownloadData:downloadData];
 }
 
 - (void)showUpdateReleaseNotesFailedToDownloadWithError:(NSError *)error {
-  [self.inner showUpdateReleaseNotesFailedToDownloadWithError:error];
 }
 
 - (void)showUpdateNotFoundWithError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
-  self.autoAcceptFoundUpdate = NO;
-  [self.inner showUpdateNotFoundWithError:error acknowledgement:acknowledgement];
+  self.installWhenReady = NO;
+  self.readyToInstallReply = nil;
+  EmitSparkleEvent(@{@"type" : @"update-not-available"});
+  acknowledgement();
 }
 
 - (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
-  self.autoAcceptFoundUpdate = NO;
-  [self.inner showUpdaterError:error acknowledgement:acknowledgement];
+  self.installWhenReady = NO;
+  self.readyToInstallReply = nil;
+  NSString *message = error.localizedDescription.length > 0 ? error.localizedDescription : @"sparkle_error";
+  EmitSparkleEvent(@{@"type" : @"error", @"message" : message});
+  acknowledgement();
 }
 
 - (void)showDownloadInitiatedWithCancellation:(void (^)(void))cancellation {
-  [self.inner showDownloadInitiatedWithCancellation:cancellation];
+  self.receivedLength = 0;
+  self.expectedContentLength = 0;
 }
 
 - (void)showDownloadDidReceiveExpectedContentLength:(uint64_t)expectedContentLength {
-  [self.inner showDownloadDidReceiveExpectedContentLength:expectedContentLength];
+  self.expectedContentLength = expectedContentLength;
 }
 
 - (void)showDownloadDidReceiveDataOfLength:(uint64_t)length {
-  [self.inner showDownloadDidReceiveDataOfLength:length];
+  self.receivedLength += length;
+  NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+  payload[@"type"] = @"download-progress";
+  payload[@"transferred"] = @(self.receivedLength);
+  if (self.expectedContentLength > 0) {
+    payload[@"total"] = @(self.expectedContentLength);
+    double percent =
+        MIN(100.0, (double)self.receivedLength / (double)self.expectedContentLength * 100.0);
+    payload[@"percent"] = @(percent);
+  }
+  EmitSparkleEvent(payload);
 }
 
 - (void)showDownloadDidStartExtractingUpdate {
-  [self.inner showDownloadDidStartExtractingUpdate];
+  NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+  payload[@"type"] = @"download-progress";
+  payload[@"percent"] = @(100);
+  if (self.receivedLength > 0) payload[@"transferred"] = @(self.receivedLength);
+  if (self.expectedContentLength > 0) payload[@"total"] = @(self.expectedContentLength);
+  EmitSparkleEvent(payload);
 }
 
 - (void)showExtractionReceivedProgress:(double)progress {
-  [self.inner showExtractionReceivedProgress:progress];
 }
 
 - (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply {
-  [self.inner showReadyToInstallAndRelaunch:reply];
+  if (self.installWhenReady) {
+    self.installWhenReady = NO;
+    self.readyToInstallReply = nil;
+    reply(SPUUserUpdateChoiceInstall);
+    return;
+  }
+
+  self.readyToInstallReply = [reply copy];
+  NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+  payload[@"type"] = @"update-downloaded";
+  if (self.updateVersion.length > 0) payload[@"version"] = self.updateVersion;
+  EmitSparkleEvent(payload);
 }
 
-- (void)showInstallingUpdateWithApplicationTerminated:(BOOL)applicationTerminated retryTerminatingApplication:(void (^)(void))retryTerminatingApplication {
-  [self.inner showInstallingUpdateWithApplicationTerminated:applicationTerminated retryTerminatingApplication:retryTerminatingApplication];
+- (void)showInstallingUpdateWithApplicationTerminated:(BOOL)applicationTerminated
+                         retryTerminatingApplication:(void (^)(void))retryTerminatingApplication {
 }
 
-- (void)showUpdateInstalledAndRelaunched:(BOOL)relaunched acknowledgement:(void (^)(void))acknowledgement {
-  [self.inner showUpdateInstalledAndRelaunched:relaunched acknowledgement:acknowledgement];
+- (void)showUpdateInstalledAndRelaunched:(BOOL)relaunched
+                         acknowledgement:(void (^)(void))acknowledgement {
+  acknowledgement();
 }
 
 - (void)dismissUpdateInstallation {
-  self.autoAcceptFoundUpdate = NO;
-  [self.inner dismissUpdateInstallation];
+  self.installWhenReady = NO;
+  self.readyToInstallReply = nil;
 }
 
 - (void)showUpdateInFocus {
-  if ([self.inner respondsToSelector:@selector(showUpdateInFocus)]) {
-    [self.inner showUpdateInFocus];
-  }
 }
 
 @end
@@ -127,8 +207,7 @@
 namespace {
 
 SPUUpdater *g_updater = nil;
-AutoAcceptUserDriver *g_userDriver = nil;
-SPUStandardUserDriver *g_standardDriver = nil;
+SilentUserDriver *g_userDriver = nil;
 SparkleBridgeLogDelegate *g_logDelegate = nil;
 
 NSString *NapiStringToNSString(const Napi::Value &value) {
@@ -159,9 +238,8 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
 
     @try {
       g_logDelegate = [[SparkleBridgeLogDelegate alloc] init];
+      g_userDriver = [[SilentUserDriver alloc] init];
       NSBundle *hostBundle = [NSBundle mainBundle];
-      g_standardDriver = [[SPUStandardUserDriver alloc] initWithHostBundle:hostBundle delegate:nil];
-      g_userDriver = [[AutoAcceptUserDriver alloc] initWithInner:g_standardDriver];
       g_updater = [[SPUUpdater alloc] initWithHostBundle:hostBundle
                                        applicationBundle:hostBundle
                                               userDriver:g_userDriver
@@ -184,9 +262,6 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
       }
 
       if (publicEdKey != nil && plistPublicKey == nil) {
-        // Sparkle deliberately exposes no public runtime API to set SUPublicEDKey — the
-        // signing key must live in the signed Info.plist so a compromised JS layer can't
-        // swap in an attacker key at runtime. We can only surface the mismatch, not fix it.
         NSLog(
             @"[sparkle-bridge] publicEdKey was supplied but Info.plist has no SUPublicEDKey; "
              "Sparkle has no supported runtime setter for it — the key must be baked into the "
@@ -198,7 +273,6 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
         NSLog(@"[sparkle-bridge] startUpdater failed: %@", startError);
         g_updater = nil;
         g_userDriver = nil;
-        g_standardDriver = nil;
         g_logDelegate = nil;
         initialized = NO;
         return;
@@ -209,7 +283,6 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
       NSLog(@"[sparkle-bridge] init threw: %@", exception.reason);
       g_updater = nil;
       g_userDriver = nil;
-      g_standardDriver = nil;
       g_logDelegate = nil;
       initialized = NO;
     }
@@ -224,20 +297,7 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
   return Napi::Boolean::New(env, initialized);
 }
 
-void RunUpdateCheck(BOOL autoAccept) {
-  void (^work)(void) = ^{
-    if (g_updater == nil || g_userDriver == nil) return;
-    @try {
-      NSLog(@"[sparkle-bridge] checkForUpdates: autoAccept=%d canCheckForUpdates=%d sessionInProgress=%d",
-            autoAccept, g_updater.canCheckForUpdates, g_updater.sessionInProgress);
-      g_userDriver.autoAcceptFoundUpdate = autoAccept;
-      [g_updater checkForUpdates];
-    } @catch (NSException *exception) {
-      NSLog(@"[sparkle-bridge] checkForUpdates threw: %@", exception.reason);
-      g_userDriver.autoAcceptFoundUpdate = NO;
-    }
-  };
-
+void RunOnMain(void (^work)(void)) {
   if ([NSThread isMainThread]) {
     work();
   } else {
@@ -247,13 +307,38 @@ void RunUpdateCheck(BOOL autoAccept) {
 
 Napi::Value CheckForUpdates(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
-  RunUpdateCheck(NO);
+  RunOnMain(^{
+    if (g_updater == nil) return;
+    @try {
+      NSLog(@"[sparkle-bridge] checkForUpdates: canCheckForUpdates=%d sessionInProgress=%d",
+            g_updater.canCheckForUpdates, g_updater.sessionInProgress);
+      [g_updater checkForUpdates];
+    } @catch (NSException *exception) {
+      NSLog(@"[sparkle-bridge] checkForUpdates threw: %@", exception.reason);
+    }
+  });
   return env.Undefined();
 }
 
 Napi::Value InstallUpdateNow(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
-  RunUpdateCheck(YES);
+  RunOnMain(^{
+    if (g_updater == nil || g_userDriver == nil) return;
+    @try {
+      void (^reply)(SPUUserUpdateChoice) = g_userDriver.readyToInstallReply;
+      if (reply != nil) {
+        g_userDriver.readyToInstallReply = nil;
+        g_userDriver.installWhenReady = NO;
+        reply(SPUUserUpdateChoiceInstall);
+        return;
+      }
+      g_userDriver.installWhenReady = YES;
+      [g_updater checkForUpdates];
+    } @catch (NSException *exception) {
+      NSLog(@"[sparkle-bridge] installUpdateNow threw: %@", exception.reason);
+      if (g_userDriver != nil) g_userDriver.installWhenReady = NO;
+    }
+  });
   return env.Undefined();
 }
 
@@ -267,21 +352,33 @@ Napi::Value SetAutomaticChecks(const Napi::CallbackInfo &info) {
 
   bool enabled = info[0].As<Napi::Boolean>().Value();
 
-  void (^work)(void) = ^{
+  RunOnMain(^{
     if (g_updater == nil) return;
     @try {
       g_updater.automaticallyChecksForUpdates = enabled;
     } @catch (NSException *exception) {
       NSLog(@"[sparkle-bridge] setAutomaticChecks threw: %@", exception.reason);
     }
-  };
+  });
 
-  if ([NSThread isMainThread]) {
-    work();
-  } else {
-    dispatch_async(dispatch_get_main_queue(), work);
+  return env.Undefined();
+}
+
+Napi::Value SetEventHandler(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    Napi::TypeError::New(env, "setEventHandler(fn) requires a function").ThrowAsJavaScriptException();
+    return env.Undefined();
   }
 
+  if (g_hasEventHandler.exchange(false)) {
+    g_eventTsfn.Release();
+  }
+
+  g_eventTsfn = Napi::ThreadSafeFunction::New(
+      env, info[0].As<Napi::Function>(), "sparkle-events", 0, 1);
+  g_hasEventHandler.store(true);
   return env.Undefined();
 }
 
@@ -290,6 +387,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
   exports.Set(Napi::String::New(env, "checkForUpdates"), Napi::Function::New(env, CheckForUpdates));
   exports.Set(Napi::String::New(env, "installUpdateNow"), Napi::Function::New(env, InstallUpdateNow));
   exports.Set(Napi::String::New(env, "setAutomaticChecks"), Napi::Function::New(env, SetAutomaticChecks));
+  exports.Set(Napi::String::New(env, "setEventHandler"), Napi::Function::New(env, SetEventHandler));
   return exports;
 }
 

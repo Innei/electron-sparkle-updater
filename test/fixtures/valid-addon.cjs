@@ -5,4 +5,5 @@ module.exports = {
   checkForUpdates() {},
   installUpdateNow() {},
   setAutomaticChecks() {},
+  setEventHandler() {},
 };

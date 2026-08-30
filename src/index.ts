@@ -7,11 +7,32 @@ export interface SparkleInitOptions {
   publicEdKey: string;
 }
 
+export type SparkleBridgeEventType =
+  | "checking"
+  | "update-available"
+  | "download-progress"
+  | "update-downloaded"
+  | "update-not-available"
+  | "error";
+
+export interface SparkleBridgeEvent {
+  type: SparkleBridgeEventType | string;
+  version?: string;
+  releaseName?: string;
+  releaseDate?: string;
+  releaseNotes?: string;
+  percent?: number;
+  transferred?: number;
+  total?: number;
+  message?: string;
+}
+
 export interface SparkleBridge {
   init(options: SparkleInitOptions): boolean;
   checkForUpdates(): void;
   installUpdateNow(): void;
   setAutomaticChecks(enabled: boolean): void;
+  setEventHandler(handler: (event: SparkleBridgeEvent) => void): void;
 }
 
 interface ResolveSparkleAddonPathDeps {
@@ -67,7 +88,8 @@ export function loadSparkleBridge(deps: LoadSparkleBridgeDeps): SparkleBridge | 
       typeof addon.init !== "function" ||
       typeof addon.checkForUpdates !== "function" ||
       typeof addon.installUpdateNow !== "function" ||
-      typeof addon.setAutomaticChecks !== "function"
+      typeof addon.setAutomaticChecks !== "function" ||
+      typeof addon.setEventHandler !== "function"
     ) {
       deps.log?.("addon loaded but missing expected exports, treating as unavailable");
       return null;

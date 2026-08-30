@@ -80,6 +80,7 @@ describe("loadSparkleBridge", () => {
     });
     expect(result).not.toBeNull();
     expect(typeof result?.init).toBe("function");
+    expect(typeof result?.setEventHandler).toBe("function");
     expect(result?.init({ appcastUrl: "https://example.com/appcast.xml", publicEdKey: "key" })).toBe(true);
   });
 
@@ -127,6 +128,7 @@ describe("loadSparkleBridge", () => {
       expect(typeof result.checkForUpdates).toBe("function");
       expect(typeof result.installUpdateNow).toBe("function");
       expect(typeof result.setAutomaticChecks).toBe("function");
+      expect(typeof result.setEventHandler).toBe("function");
     } else {
       expect(log).toHaveBeenCalledTimes(1);
       expect(log.mock.calls[0][0]).toContain(expectedPath);
