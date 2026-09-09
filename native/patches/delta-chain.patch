@@ -1,0 +1,668 @@
+diff --git a/Autoupdate/AppInstaller.m b/Autoupdate/AppInstaller.m
+index ddbc9ed..ad02b29 100644
+--- a/Autoupdate/AppInstaller.m
++++ b/Autoupdate/AppInstaller.m
+@@ -17,6 +17,9 @@
+ #import "SPUMessageTypes.h"
+ #import "SPUSecureCoding.h"
+ #import "SPUInstallationInputData.h"
++#import "SUDeltaChainApply.h"
++#import "SUBinaryDeltaUnarchiver.h"
++#import "SUStandardVersionComparator.h"
+ #import "SUUnarchiver.h"
+ #import "SUFileManager.h"
+ #import "SPUInstallationInfo.h"
+@@ -67,6 +70,8 @@ @implementation AppInstaller
+     NSString *_updateDirectoryPath;
+     NSString *_extractionDirectory;
+     NSString *_downloadName;
++    NSArray<SPUInstallationInputData *> *_deltaChainInputs;
++    NSArray<NSString *> *_deltaChainPaths;
+     NSString *_decryptionPassword;
+     SUSignatures *_signatures;
+     NSString *_relaunchPath;
+@@ -242,10 +247,42 @@ - (void)start
+     });
+ }
+ 
++
++- (void)extractDeltaChain SPU_OBJC_DIRECT
++{
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        NSError *error = nil;
++        // The envelope carries prefix metadata; the apply routine accepts only flat steps.
++        SPUInstallationInputData *last = self->_deltaChainInputs.lastObject;
++        last.deltaChainPrefix = nil;
++        BOOL success = SUApplyDeltaChain(self->_deltaChainInputs, self->_deltaChainPaths, self->_host, self->_updateDirectoryPath, self->_extractionDirectory, ^(double progress) {
++            uint64_t bits;
++            memcpy(&bits, &progress, sizeof(bits));
++            bits = CFSwapInt64HostToLittle(bits);
++            [self->_communicator handleMessageWithIdentifier:SPUExtractedArchiveWithProgress data:[NSData dataWithBytes:&bits length:sizeof(bits)]];
++        }, &error);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (!success) {
++                [self unarchiverDidFailWithError:error];
++            } else {
++                [SUBinaryDeltaUnarchiver updateSpotlightImportersAtBundlePath:[self->_extractionDirectory stringByAppendingPathComponent:self->_host.bundlePath.lastPathComponent]];
++                [self->_communicator handleMessageWithIdentifier:SPUValidationStarted data:[NSData data]];
++                [self->_communicator handleMessageWithIdentifier:SPUInstallationStartedStage1 data:[NSData data]];
++                self->_finishedValidation = YES;
++                if (self->_agentInitiatedConnection) [self retrieveProcessIdentifierAndStartInstallation];
++            }
++        });
++    });
++}
++
+ - (void)extractAndInstallUpdate SPU_OBJC_DIRECT
+ {
+     [_communicator handleMessageWithIdentifier:SPUExtractionStarted data:[NSData data]];
+     
++    if (_deltaChainInputs.count > 0) {
++        [self extractDeltaChain];
++        return;
++    }
+     NSString *archivePath = [_updateDirectoryPath stringByAppendingPathComponent:_downloadName];
+     
+     id<SUUnarchiverProtocol> unarchiver = [SUUnarchiver unarchiverForPath:archivePath extractionDirectory:_extractionDirectory updatingHostBundlePath:_host.bundlePath decryptionPassword:_decryptionPassword expectingInstallationType:_installationType];
+@@ -357,6 +394,8 @@ - (void)unarchiverDidFailWithError:(NSError *)error SPU_OBJC_DIRECT
+     // but may as well set other fields to nil too
+     [self clearUpdateDirectory];
+     _downloadName = nil;
++    _deltaChainInputs = nil;
++    _deltaChainPaths = nil;
+     _extractionDirectory = nil;
+     _decryptionPassword = nil;
+     _signatures = nil;
+@@ -470,11 +509,15 @@ - (void)handleMessageWithIdentifier:(int32_t)identifier data:(NSData *)data
+                 return;
+             }
+             
++            NSArray<SPUInstallationInputData *> *chain = installationData.deltaChainPrefix.count > 0 ? [installationData.deltaChainPrefix arrayByAddingObject:installationData] : @[installationData];
++            NSMutableArray<NSString *> *chainPaths = [NSMutableArray array];
++            NSString *downloadName = nil;
++            for (SPUInstallationInputData *stepData in chain) {
+             // Resolve the bookmark data for the downloaded update
+             // See "Share file access between processes with URL bookmarks" in https://developer.apple.com/documentation/security/app_sandbox/accessing_files_from_the_macos_app_sandbox
+             BOOL isStale = NO;
+             NSError *bookmarkError = nil;
+-            NSURL *downloadURL = [NSURL URLByResolvingBookmarkData:installationData.updateURLBookmarkData options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&isStale error:&bookmarkError];
++            NSURL *downloadURL = [NSURL URLByResolvingBookmarkData:stepData.updateURLBookmarkData options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&isStale error:&bookmarkError];
+             if (downloadURL == nil) {
+                 [self cleanupAndExitWithStatus:EXIT_FAILURE error:[NSError errorWithDomain:SUSparkleErrorDomain code:SPUInstallerError userInfo:@{ NSLocalizedDescriptionKey: @"Error: Failed to resolve bookmark data from downloaded update", NSUnderlyingErrorKey: bookmarkError }]];
+                 
+@@ -518,7 +561,7 @@ - (void)handleMessageWithIdentifier:(int32_t)identifier data:(NSData *)data
+             // This adds better security if there are any vulnerabilities in extracting/executing archives
+             // which allow writing in unexpected locations. For zip/tar/dmg archives we may also extract them before
+             // performing signing validation (due to key rotation).
+-            NSString *downloadName;
++            // downloadName is retained for the final archive below.
+             NSString *randomizedUUIDString = [[NSUUID UUID] UUIDString];
+             if (randomizedUUIDString != nil) {
+                 // Find the real path extension of the download name
+@@ -576,7 +619,11 @@ - (void)handleMessageWithIdentifier:(int32_t)identifier data:(NSData *)data
+                 return;
+             }
+             
+-            NSString *extractionDirectory = [SPULocalCacheDirectory createUniqueDirectoryInDirectory:cacheInstallationPath];
++            [chainPaths addObject:downloadDestinationPath];
++            }
++            self->_deltaChainInputs = chain.count > 1 ? chain : nil;
++            self->_deltaChainPaths = chain.count > 1 ? chainPaths : nil;
++            NSString *extractionDirectory = chain.count > 1 ? [cacheInstallationPath stringByAppendingPathComponent:NSUUID.UUID.UUIDString] : [SPULocalCacheDirectory createUniqueDirectoryInDirectory:cacheInstallationPath];
+             if (extractionDirectory == nil) {
+                 [self cleanupAndExitWithStatus:EXIT_FAILURE error:[NSError errorWithDomain:SUSparkleErrorDomain code:SPUInstallerError userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Error: Failed to create installation extraction directory in %@", cacheInstallationPath] }]];
+                 
+diff --git a/Autoupdate/SPUInstallationInputData.h b/Autoupdate/SPUInstallationInputData.h
+index 67513f9..0bc894f 100644
+--- a/Autoupdate/SPUInstallationInputData.h
++++ b/Autoupdate/SPUInstallationInputData.h
+@@ -12,7 +12,12 @@
+ 
+ NS_ASSUME_NONNULL_BEGIN
+ 
+-SPU_OBJC_DIRECT_MEMBERS @interface SPUInstallationInputData : NSObject <NSSecureCoding>
++#ifndef BUILDING_SPARKLE_TESTS
++SPU_OBJC_DIRECT_MEMBERS
++#else
++__attribute__((objc_runtime_name("SPUTestInstallationInputData")))
++#endif
++@interface SPUInstallationInputData : NSObject <NSSecureCoding>
+ 
+ /*
+  * relaunchPath - path to application bundle to relaunch and listen for termination
+@@ -26,6 +31,7 @@ SPU_OBJC_DIRECT_MEMBERS @interface SPUInstallationInputData : NSObject <NSSecure
+  */
+ - (instancetype)initWithRelaunchPath:(NSString *)relaunchPath hostBundlePath:(NSString *)hostBundlePath updateURLBookmarkData:(NSData *)updateURLBookmarkData installationType:(NSString *)installationType signatures:(SUSignatures * _Nullable)signatures decryptionPassword:(nullable NSString *)decryptionPassword expectedVersion:(NSString *)expectedVersion expectedContentLength:(uint64_t)expectedContentLength;
+ 
++@property (nonatomic, copy, nullable) NSArray<SPUInstallationInputData *> *deltaChainPrefix;
+ @property (nonatomic, copy, readonly) NSString *relaunchPath;
+ @property (nonatomic, copy, readonly) NSString *hostBundlePath;
+ @property (nonatomic, copy, readonly) NSData *updateURLBookmarkData;
+diff --git a/Autoupdate/SPUInstallationInputData.m b/Autoupdate/SPUInstallationInputData.m
+index 34469a8..de1cf60 100644
+--- a/Autoupdate/SPUInstallationInputData.m
++++ b/Autoupdate/SPUInstallationInputData.m
+@@ -23,6 +23,7 @@
+ 
+ @implementation SPUInstallationInputData
+ 
++@synthesize deltaChainPrefix = _deltaChainPrefix;
+ @synthesize relaunchPath = _relaunchPath;
+ @synthesize hostBundlePath = _hostBundlePath;
+ @synthesize updateURLBookmarkData = _updateURLBookmarkData;
+@@ -84,11 +85,21 @@ - (nullable instancetype)initWithCoder:(NSCoder *)decoder
+     NSString *expectedVersion = [decoder decodeObjectOfClass:[NSString class] forKey:SUExpectedVersionKey];
+     uint64_t expectedContentLength = (uint64_t)[decoder decodeInt64ForKey:SUExpectedContentLength];
+     
+-    return [self initWithRelaunchPath:relaunchPath hostBundlePath:hostBundlePath updateURLBookmarkData:updateURLBookmarkData installationType:installationType signatures:signatures decryptionPassword:decryptionPassword expectedVersion:expectedVersion expectedContentLength:expectedContentLength];
++    self = [self initWithRelaunchPath:relaunchPath hostBundlePath:hostBundlePath updateURLBookmarkData:updateURLBookmarkData installationType:installationType signatures:signatures decryptionPassword:decryptionPassword expectedVersion:expectedVersion expectedContentLength:expectedContentLength];
++    if (self != nil && [decoder containsValueForKey:@"deltaChainPrefix"]) {
++        _deltaChainPrefix = [decoder decodeObjectOfClasses:[NSSet setWithObjects:NSArray.class, SPUInstallationInputData.class, nil] forKey:@"deltaChainPrefix"];
++        if (_deltaChainPrefix.count > 31) return nil;
++        for (SPUInstallationInputData *step in _deltaChainPrefix) {
++            if (![step isKindOfClass:SPUInstallationInputData.class] || step.deltaChainPrefix.count != 0 ||
++                ![step.hostBundlePath isEqualToString:hostBundlePath] || ![step.installationType isEqualToString:SPUInstallationTypeApplication]) return nil;
++        }
++    }
++    return self;
+ }
+ 
+ - (void)encodeWithCoder:(NSCoder *)coder
+ {
++    if (_deltaChainPrefix.count > 0) [coder encodeObject:_deltaChainPrefix forKey:@"deltaChainPrefix"];
+     [coder encodeObject:_relaunchPath forKey:SURelaunchPathKey];
+     [coder encodeObject:_hostBundlePath forKey:SUHostBundlePathKey];
+     [coder encodeObject:_updateURLBookmarkData forKey:SUUpdateURLBookmarkDataKey];
+diff --git a/Autoupdate/SUBinaryDeltaUnarchiver.h b/Autoupdate/SUBinaryDeltaUnarchiver.h
+index 8a2bba9..3f3fc7f 100644
+--- a/Autoupdate/SUBinaryDeltaUnarchiver.h
++++ b/Autoupdate/SUBinaryDeltaUnarchiver.h
+@@ -21,6 +21,8 @@ SPU_OBJC_DIRECT_MEMBERS
+ 
+ - (instancetype)initWithArchivePath:(NSString *)archivePath extractionDirectory:(NSString *)extractionDirectory updateHostBundlePath:(NSString *)updateHostBundlePath;
+ 
+++ (void)updateSpotlightImportersAtBundlePath:(NSString *)targetPath;
++
+ + (BOOL)canUnarchivePath:(NSString *)path;
+ 
+ @end
+diff --git a/Autoupdate/SUDeltaChainApply.h b/Autoupdate/SUDeltaChainApply.h
+new file mode 100644
+index 0000000..baeb2de
+--- /dev/null
++++ b/Autoupdate/SUDeltaChainApply.h
+@@ -0,0 +1,57 @@
++// Shared with the native regression tests. The caller owns the private cache
++// and removes it on failure. The installed host is never an output directory.
++#import "SPUInstallationInputData.h"
++#import "SUBinaryDeltaApply.h"
++#import "SUUpdateValidator.h"
++#import "SPUVerifierInformation.h"
++#import "SUHost.h"
++#import "SUFileManager.h"
++#import "SUStandardVersionComparator.h"
++#import "SPUInstallationType.h"
++#import "SUErrors.h"
++
++static inline BOOL SUApplyDeltaChain(NSArray<SPUInstallationInputData *> *steps, NSArray<NSString *> *archives, SUHost *host, NSString *cache, NSString *destination, void (^progress)(double), NSError **failure)
++{
++    NSError *error = nil;
++    NSString *source = host.bundlePath;
++    NSString *version = host.version;
++    NSString *previousDirectory = nil;
++    BOOL complete = NO;
++    if (steps.count > 0 && steps.count <= 32 && steps.count == archives.count) {
++        for (NSUInteger index = 0; index < steps.count; index++) {
++            @autoreleasepool {
++                SPUInstallationInputData *step = steps[index];
++                NSString *archive = archives[index];
++                BOOL last = index + 1 == steps.count;
++                NSString *directory = last ? destination : [cache stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
++                if (step.expectedVersion.length == 0 || step.expectedContentLength == 0 || step.deltaChainPrefix.count != 0 ||
++                    ![step.installationType isEqualToString:SPUInstallationTypeApplication] ||
++                    [SUStandardVersionComparator.defaultComparator compareVersion:version toVersion:step.expectedVersion] != NSOrderedAscending) break;
++                if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions: @0700} error:&error]) break;
++                SPUVerifierInformation *information = [[SPUVerifierInformation alloc] initWithExpectedVersion:step.expectedVersion expectedContentLength:step.expectedContentLength];
++                NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:archive error:&error];
++                if (attributes == nil || ![attributes[NSFileType] isEqual:NSFileTypeRegular]) break;
++                information.actualContentLength = attributes.fileSize;
++                SUUpdateValidator *validator = [[SUUpdateValidator alloc] initWithDownloadPath:archive signatures:step.signatures host:host verifierInformation:information];
++                if (![validator validateHostHasPublicKeys:&error] || ![validator validateDownloadPathWithFallbackOnCodeSigning:NO error:&error]) break;
++                NSString *output = [directory stringByAppendingPathComponent:host.bundlePath.lastPathComponent];
++                if (!applyBinaryDelta(source, output, archive, NO, ^(double value) {
++                    progress(((double)index + value) / (double)steps.count);
++                }, &error) || ![validator validateWithUpdateDirectory:directory error:&error]) break;
++                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[output stringByAppendingPathComponent:@"Contents/Info.plist"]];
++                NSString *trustedKey = [host.bundle objectForInfoDictionaryKey:@"SUPublicEDKey"];
++                if (trustedKey.length == 0 || ![info[@"SUPublicEDKey"] isEqual:trustedKey] ||
++                    ![info[@"CFBundleIdentifier"] isEqual:host.bundle.bundleIdentifier]) break;
++                if (previousDirectory != nil && ![[[SUFileManager alloc] init] removeItemAtURL:[NSURL fileURLWithPath:previousDirectory] error:&error]) break;
++                previousDirectory = directory;
++                source = output;
++                version = step.expectedVersion;
++                complete = last;
++            }
++        }
++    }
++    if (!complete && failure != NULL) {
++        *failure = error ?: [NSError errorWithDomain:SUSparkleErrorDomain code:SUValidationError userInfo:@{NSLocalizedDescriptionKey: @"Invalid, incompatible, or incomplete delta chain"}];
++    }
++    return complete;
++}
+diff --git a/Sparkle.xcodeproj/project.pbxproj b/Sparkle.xcodeproj/project.pbxproj
+index 39b11e9..ae5d013 100644
+--- a/Sparkle.xcodeproj/project.pbxproj
++++ b/Sparkle.xcodeproj/project.pbxproj
+@@ -37,6 +37,7 @@
+ /* End PBXAggregateTarget section */
+ 
+ /* Begin PBXBuildFile section */
++		DE17ACAA0000000000000001 /* SPUInstallationInputData.m in Sources */ = {isa = PBXBuildFile; fileRef = 7267E5AD1D3D8AB700D1BF90 /* SPUInstallationInputData.m */; };
+ 		142E0E0019A6954400E4312B /* Sparkle.framework in Copy Frameworks */ = {isa = PBXBuildFile; fileRef = 8DC2EF5B0486A6940098B216 /* Sparkle.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+ 		142E0E0219A6A14700E4312B /* Sparkle.framework in Copy Files */ = {isa = PBXBuildFile; fileRef = 8DC2EF5B0486A6940098B216 /* Sparkle.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+ 		142E0E0919A83AAC00E4312B /* SUBinaryDeltaTest.m in Sources */ = {isa = PBXBuildFile; fileRef = 142E0E0819A83AAC00E4312B /* SUBinaryDeltaTest.m */; };
+@@ -3345,6 +3346,7 @@
+ 			isa = PBXSourcesBuildPhase;
+ 			buildActionMask = 2147483647;
+ 			files = (
++				DE17ACAA0000000000000001 /* SPUInstallationInputData.m in Sources */,
+ 				72C56E202F04B3760005A484 /* Signing.swift in Sources */,
+ 				72C56E1F2F04AC890005A484 /* SUFeedSignatureVerifierTest.swift in Sources */,
+ 				72D04F3E2B097D4300A6DEAA /* SPUVerifierInformation.m in Sources */,
+diff --git a/Sparkle/SPUCoreBasedUpdateDriver.m b/Sparkle/SPUCoreBasedUpdateDriver.m
+index 563a136..bd92a56 100644
+--- a/Sparkle/SPUCoreBasedUpdateDriver.m
++++ b/Sparkle/SPUCoreBasedUpdateDriver.m
+@@ -19,6 +19,7 @@
+ #import "SPUDownloadedUpdate.h"
+ #import "SPUInformationalUpdate.h"
+ #import "SUAppcastItem.h"
++#import "SUAppcastItem+Private.h"
+ #import "SULocalizations.h"
+ #import "SPUInstallationType.h"
+ #import "SUPhasedUpdateGroupInfo.h"
+@@ -33,6 +34,9 @@ @implementation SPUCoreBasedUpdateDriver
+ {
+     SPUBasicUpdateDriver *_basicDriver;
+     SPUDownloadDriver *_downloadDriver;
++    NSMutableArray<SPUDownloadedUpdate *> *_deltaDownloads;
++    NSArray<SUAppcastItem *> *_deltaPlan;
++    uint64_t _deltaTotal;
+     SPUInstallerDriver *_installerDriver;
+     SUAppcastItem *_updateItem;
+     SUAppcastItem * _Nullable _secondaryUpdateItem;
+@@ -127,6 +131,13 @@ - (void)basicDriverDidFindUpdateWithAppcastItem:(SUAppcastItem *)updateItem seco
+ 
+ - (void)downloadUpdateFromAppcastItem:(SUAppcastItem *)updateItem secondaryAppcastItem:(SUAppcastItem * _Nullable)secondaryUpdateItem inBackground:(BOOL)background SPU_OBJC_DIRECT
+ {
++    if (updateItem.deltaChainPrefix.count > 0 && _deltaPlan == nil) {
++        _deltaPlan = [updateItem.deltaChainPrefix arrayByAddingObject:updateItem];
++        _deltaDownloads = [NSMutableArray array];
++        _deltaTotal = 0;
++        for (SUAppcastItem *item in _deltaPlan) _deltaTotal += item.contentLength;
++        updateItem = _deltaPlan.firstObject;
++    }
+     _downloadDriver = [[SPUDownloadDriver alloc] initWithUpdateItem:updateItem secondaryUpdateItem:secondaryUpdateItem host:_host userAgent:_userAgent httpHeaders:_httpHeaders inBackground:background delegate:self];
+     
+     id updater = _updater;
+@@ -141,6 +152,7 @@ - (void)downloadUpdateFromAppcastItem:(SUAppcastItem *)updateItem secondaryAppca
+ 
+ - (void)downloadDriverWillBeginDownload
+ {
++    if (_deltaDownloads.count > 0) return;
+     id<SPUCoreBasedUpdateDriverDelegate> delegate = _delegate;
+     if ([delegate respondsToSelector:@selector(downloadDriverWillBeginDownload)]) {
+         [delegate downloadDriverWillBeginDownload];
+@@ -151,7 +163,7 @@ - (void)downloadDriverDidReceiveExpectedContentLength:(uint64_t)expectedContentL
+ {
+     id<SPUCoreBasedUpdateDriverDelegate> delegate = _delegate;
+     if ([delegate respondsToSelector:@selector(downloadDriverDidReceiveExpectedContentLength:)]) {
+-        [delegate downloadDriverDidReceiveExpectedContentLength:expectedContentLength];
++        [delegate downloadDriverDidReceiveExpectedContentLength:_deltaPlan != nil ? _deltaTotal : expectedContentLength];
+     }
+ }
+ 
+@@ -165,6 +177,20 @@ - (void)downloadDriverDidReceiveDataOfLength:(uint64_t)length
+ 
+ - (void)downloadDriverDidDownloadUpdate:(SPUDownloadedUpdate *)downloadedUpdate
+ {
++    if (_deltaPlan != nil) {
++        if (_deltaDownloads.count + 1 < _deltaPlan.count) {
++            [_deltaDownloads addObject:downloadedUpdate];
++            SUAppcastItem *next = _deltaPlan[_deltaDownloads.count];
++            BOOL background = _downloadDriver.inBackground;
++            [_downloadDriver cleanup:^{
++                if (self->_deltaPlan != nil) [self downloadUpdateFromAppcastItem:next secondaryAppcastItem:self->_secondaryUpdateItem inBackground:background];
++            }];
++            return;
++        }
++        downloadedUpdate.deltaChainPrefix = [_deltaDownloads copy];
++        _deltaDownloads = nil;
++        _deltaPlan = nil;
++    }
+     // Use a new update group for our next downloaded update
+     // We could restrict this to when the appcast was downloaded in the background,
+     // but it shouldn't matter.
+@@ -365,6 +391,9 @@ - (void)fallBackAndDownloadRegularUpdate SPU_OBJC_DIRECT
+     assert(secondaryUpdateItem != nil);
+     
+     BOOL backgroundDownload = _downloadDriver.inBackground;
++    for (SPUDownloadedUpdate *download in _deltaDownloads) [_downloadDriver removeDownloadedUpdate:download];
++    _deltaDownloads = nil;
++    _deltaPlan = nil;
+     
+     // Fall back to the non-delta update. Note that we don't want to trigger another update was found event.
+     _updateItem = secondaryUpdateItem;
+@@ -383,6 +412,9 @@ - (void)installerDidFailToApplyDeltaUpdate
+ - (void)abortUpdateAndShowNextUpdateImmediately:(BOOL)shouldShowUpdateImmediately error:(nullable NSError *)error
+ {
+     [_installerDriver abortInstall];
++    for (SPUDownloadedUpdate *download in _deltaDownloads) [_downloadDriver removeDownloadedUpdate:download];
++    _deltaDownloads = nil;
++    _deltaPlan = nil;
+     
+     void (^basicDriverAbort)(void) = ^{
+         id<SPUResumableUpdate> resumableUpdate = (error == nil || error.code == SUInstallationAuthorizeLaterError) ? self->_resumableUpdate : nil;
+diff --git a/Sparkle/SPUDownloadDriver.m b/Sparkle/SPUDownloadDriver.m
+index 0097e35..47f101c 100644
+--- a/Sparkle/SPUDownloadDriver.m
++++ b/Sparkle/SPUDownloadDriver.m
+@@ -182,6 +182,7 @@ - (void)downloadFile
+ 
+ - (void)removeDownloadedUpdate:(SPUDownloadedUpdate *)downloadedUpdate
+ {
++    for (SPUDownloadedUpdate *prefix in downloadedUpdate.deltaChainPrefix) [self removeDownloadedUpdate:prefix];
+     NSString *bundleIdentifier = _host.bundle.bundleIdentifier;
+     assert(bundleIdentifier != nil);
+     
+diff --git a/Sparkle/SPUDownloadedUpdate.h b/Sparkle/SPUDownloadedUpdate.h
+index 38daed1..080f44c 100644
+--- a/Sparkle/SPUDownloadedUpdate.h
++++ b/Sparkle/SPUDownloadedUpdate.h
+@@ -15,6 +15,7 @@ SPU_OBJC_DIRECT_MEMBERS @interface SPUDownloadedUpdate : NSObject <SPUResumableU
+ 
+ - (instancetype)initWithAppcastItem:(SUAppcastItem *)updateItem secondaryAppcastItem:(SUAppcastItem * _Nullable)secondaryItem downloadBookmarkData:(NSData *)downloadBookmarkData downloadToken:(NSString *)downloadToken;
+ 
++@property (nonatomic, copy, nullable) NSArray<SPUDownloadedUpdate *> *deltaChainPrefix;
+ @property (nonatomic, readonly) NSData *downloadBookmarkData;
+ @property (nonatomic, readonly) NSString *downloadToken;
+ 
+diff --git a/Sparkle/SPUDownloadedUpdate.m b/Sparkle/SPUDownloadedUpdate.m
+index 5c2b418..0f28226 100644
+--- a/Sparkle/SPUDownloadedUpdate.m
++++ b/Sparkle/SPUDownloadedUpdate.m
+@@ -18,6 +18,7 @@ @implementation SPUDownloadedUpdate
+ @synthesize updateItem = _updateItem;
+ @synthesize secondaryUpdateItem = _secondaryUpdateItem;
+ 
++@synthesize deltaChainPrefix = _deltaChainPrefix;
+ @synthesize downloadBookmarkData = _downloadBookmarkData;
+ @synthesize downloadToken = _downloadToken;
+ 
+diff --git a/Sparkle/SPUInstallerDriver.m b/Sparkle/SPUInstallerDriver.m
+index d780ee3..2444272 100644
+--- a/Sparkle/SPUInstallerDriver.m
++++ b/Sparkle/SPUInstallerDriver.m
+@@ -62,6 +62,7 @@ @implementation SPUInstallerDriver
+     id<SUInstallerConnectionProtocol> _installerConnection;
+     SUAppcastItem *_updateItem;
+     NSData *_updateURLBookmarkData;
++    NSArray<SPUDownloadedUpdate *> *_deltaChainPrefix;
+     NSError *_installerError;
+     
+     __weak id _updater;
+@@ -219,6 +220,7 @@ - (void)extractDownloadedUpdate:(SPUDownloadedUpdate *)downloadedUpdate silently
+ {
+     _updateItem = downloadedUpdate.updateItem;
+     _updateURLBookmarkData = downloadedUpdate.downloadBookmarkData;
++    _deltaChainPrefix = downloadedUpdate.deltaChainPrefix;
+     
+     _currentStage = SPUInstallerNotStarted;
+     
+@@ -263,6 +265,12 @@ - (void)sendInstallationData SPU_OBJC_DIRECT
+     
+     SPUInstallationInputData *installationData = [[SPUInstallationInputData alloc] initWithRelaunchPath:pathToRelaunch hostBundlePath:_host.bundlePath updateURLBookmarkData:_updateURLBookmarkData installationType:_updateItem.installationType signatures:_updateItem.signatures decryptionPassword:decryptionPassword expectedVersion:_updateItem.versionString expectedContentLength:_updateItem.contentLength];
+     
++    NSMutableArray<SPUInstallationInputData *> *prefix = [NSMutableArray array];
++    for (SPUDownloadedUpdate *download in _deltaChainPrefix) {
++        SUAppcastItem *item = download.updateItem;
++        [prefix addObject:[[SPUInstallationInputData alloc] initWithRelaunchPath:pathToRelaunch hostBundlePath:_host.bundlePath updateURLBookmarkData:download.downloadBookmarkData installationType:item.installationType signatures:item.signatures decryptionPassword:nil expectedVersion:item.versionString expectedContentLength:item.contentLength]];
++    }
++    installationData.deltaChainPrefix = prefix;
+     NSData *archivedData = SPUArchiveRootObjectSecurely(installationData);
+     if (archivedData == nil) {
+         [delegate installerIsRequestingAbortInstallWithError:[NSError errorWithDomain:SUSparkleErrorDomain code:SUInstallationError userInfo:@{ NSLocalizedDescriptionKey:@"An error occurred while encoding the installer parameters. Please try again later." }]];
+diff --git a/Sparkle/SUAppcastDriver.m b/Sparkle/SUAppcastDriver.m
+index 464300a..377245a 100644
+--- a/Sparkle/SUAppcastDriver.m
++++ b/Sparkle/SUAppcastDriver.m
+@@ -11,6 +11,7 @@
+ #import "SUAppcast+Private.h"
+ #import "SUAppcastItem.h"
+ #import "SUAppcastItem+Private.h"
++#import "SUDeltaChain.h"
+ #import "SUVersionComparisonProtocol.h"
+ #import "SUStandardVersionComparator.h"
+ #import "SPUUpdaterDelegate.h"
+@@ -44,6 +45,7 @@ @interface SUAppcastDriver () <SPUDownloadDriverDelegate>
+ @implementation SUAppcastDriver
+ {
+     SUHost *_host;
++    NSArray<SUAppcastItem *> *_deltaChainItems;
+     SPUDownloadDriver *_downloadDriver;
+     
+     __weak id _updater;
+@@ -220,6 +222,7 @@ - (void)downloadDriverDidDownloadData:(SPUDownloadData *)downloadData
+     
+     SUAppcast *macOSAppcast = [SUAppcastDriver filterAppcast:loadedAppcast forMacOSAndAllowedChannels:allowedChannels];
+     
++    _deltaChainItems = macOSAppcast.items;
+     id<SUVersionComparison> applicationVersionComparator = [self versionComparator];
+     
+     BOOL background = _downloadDriver.inBackground;
+@@ -456,6 +459,26 @@ - (SUAppcastItem *)retrieveBestAppcastItemFromAppcast:(SUAppcast *)appcast versi
+     // Retrieve the preferred primary and secondary update items
+     // In the case of a delta update, the preferred primary item will be the delta update,
+     // and the secondary item will be the regular update.
++    NSNumber *configuredHistory = [_host.bundle objectForInfoDictionaryKey:@"SUDeltaChainHistory"];
++    NSUInteger history = configuredHistory == nil ? 6 : (NSUInteger)MIN(32, MAX(0, configuredHistory.integerValue));
++    if (history > 0 && regularItem != nil) {
++        NSArray<SUAppcastItem *> *path = SUDeltaChain(_deltaChainItems, regularItem, _host.version, history, versionComparator);
++        if (path.count > 0) {
++            // Preserve Sparkle's installed-bundle permission/localization preflight for the first hop.
++            SUAppcastItem *firstTarget = nil;
++            for (SUAppcastItem *item in _deltaChainItems) {
++                if ([item.versionString isEqualToString:path.firstObject.versionString]) { firstTarget = item; break; }
++            }
++            if ([self preferredUpdateForRegularAppcastItem:firstTarget secondaryUpdate:NULL] == path.firstObject) {
++                SUAppcastItem *last = path.lastObject;
++                last.deltaChainPrefix = [path subarrayWithRange:NSMakeRange(0, path.count - 1)];
++                if (secondaryAppcastItem != NULL) *secondaryAppcastItem = regularItem;
++                return last;
++            }
++        }
++        if (secondaryAppcastItem != NULL) *secondaryAppcastItem = nil;
++        return regularItem;
++    }
+     return [self preferredUpdateForRegularAppcastItem:regularItem secondaryUpdate:secondaryAppcastItem];
+ }
+ 
+diff --git a/Sparkle/SUAppcastItem+Private.h b/Sparkle/SUAppcastItem+Private.h
+index 9941d13..1fadb44 100644
+--- a/Sparkle/SUAppcastItem+Private.h
++++ b/Sparkle/SUAppcastItem+Private.h
+@@ -20,6 +20,9 @@ NS_ASSUME_NONNULL_BEGIN
+ 
+ @interface SUAppcastItem (Private) <NSSecureCoding>
+ 
++// Transient plan; excludes this final delta to avoid a retain cycle.
++@property (nonatomic, copy, nullable) NSArray<SUAppcastItem *> *deltaChainPrefix;
++
+ /**
+  Initializes with data from a dictionary provided by the RSS class and state resolver
+ 
+diff --git a/Sparkle/SUAppcastItem.m b/Sparkle/SUAppcastItem.m
+index 1089f86..168d4cd 100644
+--- a/Sparkle/SUAppcastItem.m
++++ b/Sparkle/SUAppcastItem.m
+@@ -46,6 +46,7 @@
+ static NSString *SUAppcastItemSigningValidationStatusKey = @"SUAppcastItemSigningValidationStatus";
+ 
+ @interface SUAppcastItem ()
++@property (nonatomic, copy, nullable) NSArray<SUAppcastItem *> *deltaChainPrefix;
+ 
+ @property (readonly, nonatomic, nullable) SUSignatures *signatures;
+ @property (readonly, nonatomic, nullable) SUSignatures *releaseNotesSignatures;
+@@ -67,6 +68,7 @@ @implementation SUAppcastItem
+     NSSet<NSString *> *_informationalUpdateVersions;
+ }
+ 
++@synthesize deltaChainPrefix = _deltaChainPrefix;
+ @synthesize dateString = _dateString;
+ @synthesize deltaUpdates = _deltaUpdates;
+ @synthesize displayVersionString = _displayVersionString;
+diff --git a/Sparkle/SUDeltaChain.h b/Sparkle/SUDeltaChain.h
+new file mode 100644
+index 0000000..e06bfc7
+--- /dev/null
++++ b/Sparkle/SUDeltaChain.h
+@@ -0,0 +1,48 @@
++// Bounded, forward-only delta paths. Metadata proposes a plan; the installer
++// still authenticates every patch and validates every resulting bundle.
++#import <Sparkle/SUAppcastItem.h>
++#import <Sparkle/SUVersionComparisonProtocol.h>
++
++static inline NSArray<SUAppcastItem *> *SUDeltaChain(NSArray<SUAppcastItem *> *items, SUAppcastItem *target, NSString *installed, NSUInteger history, id<SUVersionComparison> comparator)
++{
++    if (history == 0 || history > 32 || target.contentLength == 0 || target.informationOnlyUpdate ||
++        ![target.installationType isEqualToString:@"application"]) return @[];
++    NSMutableDictionary<NSString *, SUAppcastItem *> *versions = [NSMutableDictionary dictionary];
++    for (SUAppcastItem *item in items) {
++        if (![(item.channel ?: @"") isEqualToString:(target.channel ?: @"")] ||
++            ![(item.osString ?: @"") isEqualToString:(target.osString ?: @"")] ||
++            ![(item.hardwareRequirements ?: @[]) isEqual:(target.hardwareRequirements ?: @[])] ||
++            [comparator compareVersion:item.versionString toVersion:target.versionString] == NSOrderedDescending) continue;
++        // Ambiguous build identities cannot safely participate in a chain.
++        if (versions[item.versionString] != nil) return @[];
++        versions[item.versionString] = item;
++    }
++    NSArray<NSString *> *ordered = [versions.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
++        return [comparator compareVersion:b toVersion:a];
++    }];
++    if (ordered.count > history + 1) ordered = [ordered subarrayWithRange:NSMakeRange(0, history + 1)];
++    if (![ordered containsObject:installed]) return @[];
++    NSMutableDictionary<NSString *, NSNumber *> *costs = [NSMutableDictionary dictionaryWithObject:@0 forKey:installed];
++    NSMutableDictionary<NSString *, NSArray<SUAppcastItem *> *> *paths = [NSMutableDictionary dictionaryWithObject:@[] forKey:installed];
++    for (NSString *version in ordered.reverseObjectEnumerator) {
++        SUAppcastItem *item = versions[version];
++        if (item.informationOnlyUpdate || ![item.installationType isEqualToString:@"application"]) continue;
++        for (NSString *source in item.deltaUpdates) {
++            SUAppcastItem *edge = item.deltaUpdates[source];
++            if (costs[source] == nil || [comparator compareVersion:source toVersion:version] != NSOrderedAscending ||
++                edge.contentLength == 0 || ![@[@"https", @"http"] containsObject:edge.fileURL.scheme.lowercaseString]) continue;
++            NSString *signature = edge.propertiesDictionary[@"enclosure"][@"sparkle:edSignature"];
++            if (![signature isKindOfClass:NSString.class] || [[NSData alloc] initWithBase64EncodedString:signature options:(NSDataBase64DecodingOptions)0].length != 64) continue;
++            uint64_t previous = costs[source].unsignedLongLongValue;
++            if (previous >= target.contentLength || edge.contentLength >= target.contentLength - previous) continue;
++            uint64_t cost = previous + edge.contentLength;
++            NSArray<SUAppcastItem *> *path = [paths[source] arrayByAddingObject:edge];
++            if (costs[version] == nil || cost < costs[version].unsignedLongLongValue ||
++                (cost == costs[version].unsignedLongLongValue && path.count < paths[version].count)) {
++                costs[version] = @(cost);
++                paths[version] = path;
++            }
++        }
++    }
++    return paths[target.versionString] ?: @[];
++}
+diff --git a/Tests/SUBinaryDeltaTest.m b/Tests/SUBinaryDeltaTest.m
+index 7c20d90..7201797 100644
+--- a/Tests/SUBinaryDeltaTest.m
++++ b/Tests/SUBinaryDeltaTest.m
+@@ -2346,3 +2346,86 @@ - (void)testBundleCreationDate
+ }
+ 
+ @end
++
++// electron-sparkle-updater regression coverage: use the same planner and
++// authenticated staging routine as the production driver / installer.
++#import "../Sparkle/SUDeltaChain.h"
++#import "../Autoupdate/SUDeltaChainApply.h"
++#import "SUAppcastItem+Private.h"
++#import "SUSignatures.h"
++
++@interface SUDeltaChainTest : XCTestCase
++@end
++@implementation SUDeltaChainTest
++
++- (SUAppcastItem *)item:(NSString *)version edges:(NSDictionary<NSString *, NSNumber *> *)edges
++{
++    NSString *signature = [[NSMutableData dataWithLength:64] base64EncodedStringWithOptions:0];
++    NSMutableArray *deltas = [NSMutableArray array];
++    for (NSString *source in edges) {
++        [deltas addObject:@{@"url": [NSString stringWithFormat:@"https://example.com/%@-%@.delta", source, version], @"sparkle:deltaFrom": source, @"length": edges[source].stringValue, @"sparkle:edSignature": signature}];
++    }
++    return [[SUAppcastItem alloc] initWithDictionary:@{@"sparkle:version": version, @"enclosure": @{@"url": @"https://example.com/full.zip", @"length": @"500", @"sparkle:edSignature": signature}, @"sparkle:deltas": deltas} failureReason:NULL];
++}
++
++- (void)testBoundedCheapestPath
++{
++    SUAppcastItem *one = [self item:@"1" edges:@{}];
++    SUAppcastItem *two = [self item:@"2" edges:@{}];
++    SUAppcastItem *three = [self item:@"3" edges:@{@"1": @20}];
++    SUAppcastItem *four = [self item:@"4" edges:@{@"1": @80}];
++    SUAppcastItem *five = [self item:@"5" edges:@{@"3": @8}];
++    SUAppcastItem *six = [self item:@"6" edges:@{@"4": @10, @"5": @4, @"1": @100}];
++    NSArray *items = @[six, four, two, one, five, three];
++    NSArray *path = SUDeltaChain(items, six, @"1", 6, SUStandardVersionComparator.defaultComparator);
++    XCTAssertEqualObjects([path valueForKey:@"versionString"], (@[@"3", @"5", @"6"]));
++    XCTAssertEqual(SUDeltaChain(items, six, @"1", 4, SUStandardVersionComparator.defaultComparator).count, 0U);
++    XCTAssertEqual(SUDeltaChain(items, six, @"2", 6, SUStandardVersionComparator.defaultComparator).count, 0U);
++    SUAppcastItem *expensive = [self item:@"7" edges:@{@"6": @500}];
++    XCTAssertEqual(SUDeltaChain([items arrayByAddingObject:expensive], expensive, @"1", 6, SUStandardVersionComparator.defaultComparator).count, 0U);
++    SUAppcastItem *equal = [self item:@"7" edges:@{@"1": @32, @"6": @1}];
++    XCTAssertEqual(SUDeltaChain([items arrayByAddingObject:equal], equal, @"1", 6, SUStandardVersionComparator.defaultComparator).count, 1U);
++}
++
++- (void)testRealKansokuChainAndCorruptPatch
++{
++    NSString *fixture = NSProcessInfo.processInfo.environment[@"SPARKLE_CHAIN_FIXTURES"];
++    XCTSkipIf(fixture == nil, @"Set TEST_RUNNER_SPARKLE_CHAIN_FIXTURES to the acceptance manifest");
++    NSError *error = nil;
++    NSDictionary *manifest = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:fixture] options:0 error:&error];
++    XCTAssertNotNil(manifest);
++    if (manifest == nil) return;
++    SUHost *host = [[SUHost alloc] initWithBundle:[NSBundle bundleWithPath:manifest[@"host"]]];
++    NSMutableArray *steps = [NSMutableArray array];
++    NSMutableArray *archives = [NSMutableArray array];
++    for (NSDictionary *entry in manifest[@"steps"]) {
++        SUSignatures *signatures = [[SUSignatures alloc] initWithEd:entry[@"signature"]
++#if SPARKLE_BUILD_LEGACY_DSA_SUPPORT
++            dsa:nil
++#endif
++        ];
++        [steps addObject:[[SPUInstallationInputData alloc] initWithRelaunchPath:host.bundlePath hostBundlePath:host.bundlePath updateURLBookmarkData:[NSData data] installationType:@"application" signatures:signatures decryptionPassword:nil expectedVersion:entry[@"version"] expectedContentLength:[entry[@"size"] unsignedLongLongValue]]];
++        [archives addObject:entry[@"archive"]];
++    }
++    NSString *cache = [fixture.stringByDeletingLastPathComponent stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
++    XCTAssertTrue([NSFileManager.defaultManager createDirectoryAtPath:cache withIntermediateDirectories:NO attributes:nil error:&error]);
++    NSString *output = [cache stringByAppendingPathComponent:@"success"];
++    __block double lastProgress = 0;
++    BOOL success = SUApplyDeltaChain(steps, archives, host, cache, output, ^(double progress) { lastProgress = progress; }, &error);
++    XCTAssertTrue(success, @"%@", error);
++    XCTAssertEqualWithAccuracy(lastProgress, 1.0, 0.001);
++    if (success) {
++        NSString *result = [fixture.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"result-path.txt"];
++        XCTAssertTrue([output writeToFile:result atomically:YES encoding:NSUTF8StringEncoding error:&error]);
++    }
++    NSString *corrupt = [cache stringByAppendingPathComponent:@"corrupt.delta"];
++    NSMutableData *bytes = [NSMutableData dataWithContentsOfFile:archives.lastObject];
++    ((unsigned char *)bytes.mutableBytes)[bytes.length - 1] ^= 1;
++    XCTAssertTrue([bytes writeToFile:corrupt atomically:YES]);
++    archives[archives.count - 1] = corrupt;
++    error = nil;
++    XCTAssertFalse(SUApplyDeltaChain(steps, archives, host, cache, [cache stringByAppendingPathComponent:@"failure"], ^(double progress) {}, &error));
++    XCTAssertNotNil(error);
++    XCTAssertEqualObjects([[NSDictionary dictionaryWithContentsOfFile:[host.bundlePath stringByAppendingPathComponent:@"Contents/Info.plist"]] objectForKey:@"CFBundleVersion"], @"0.39.4");
++}
++@end

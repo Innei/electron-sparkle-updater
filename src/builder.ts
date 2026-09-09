@@ -38,6 +38,7 @@ export interface SparkleBuilderConfigOptions {
   feedUrl: string;
   publicEdKey?: string;
   scheduledCheckIntervalSeconds?: number;
+  deltaHistory?: number;
   localizations?: string[];
 }
 
@@ -45,6 +46,10 @@ export function sparkleBuilderConfig(
   options: SparkleBuilderConfigOptions,
   deps: SparkleLocalizationsDeps = {},
 ) {
+  const deltaHistory = options.deltaHistory ?? 6;
+  if (!Number.isInteger(deltaHistory) || deltaHistory < 0 || deltaHistory > 32) {
+    throw new RangeError("deltaHistory must be an integer between 0 and 32");
+  }
   return {
     extraFiles: [
       {
@@ -52,7 +57,7 @@ export function sparkleBuilderConfig(
         to: "Frameworks/Sparkle.framework",
       },
     ],
-    files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**"],
+    files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**", "!**/node_modules/electron-sparkle-updater/native/sparkle-chain.tar.xz"],
     asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/Release/*.node"],
     dmg: { writeUpdateInfo: false },
     zip: { writeUpdateInfo: false },
@@ -62,6 +67,7 @@ export function sparkleBuilderConfig(
         SUPublicEDKey: options.publicEdKey ?? SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
         SUEnableInstallerLauncherService: false,
         SUScheduledCheckInterval: options.scheduledCheckIntervalSeconds ?? 3600,
+        SUDeltaChainHistory: deltaHistory,
         CFBundleLocalizations: options.localizations ?? sparkleLocalizations(deps),
       },
     },

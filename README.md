@@ -1,6 +1,6 @@
 # electron-sparkle-updater
 
-**Status: work in progress.** Phases 1-2 are implemented: scaffolding + native bridge + rebuild CLI + builder fragments, the appcast CLI, the release GitHub Action, and `./fallback`. Kansoku migration (phase 3) is a separate repo/PR.
+An Electron bridge and release toolchain for Sparkle, including bounded multi-hop delta updates. Kansoku consumes the bridge and release Action.
 
 Electron's update story on macOS is Squirrel.Mac (`electron-updater` / the built-in `autoUpdater`). Sparkle — the de-facto macOS update framework used by most native Mac apps — has no maintained Electron bridge on npm. This library provides one: an N-API bridge to Sparkle.framework plus the release toolchain (appcast generation, EdDSA signing, delta updates) needed to make Sparkle actually usable end to end, extracted from a production Electron app.
 
@@ -32,7 +32,7 @@ electron-sparkle-updater rebuild [--electron-version <v>] [--arch arm64|x64|univ
 
 - `--electron-version` defaults to the version resolved from your project's own `electron` dependency (`require("electron/package.json").version`); pass it explicitly if `electron` isn't installed yet at the time you run this.
 - `--arch` defaults to `process.arch`. `--arch universal` builds arm64 and x64 separately, then `lipo`-combines them into one binary.
-- `--force-fetch` re-downloads and re-verifies the vendored Sparkle.framework even if it's already present.
+- `--force-fetch` regenerates `native/vendor` from the bundled framework archive. In a source checkout without that archive, it builds the pinned Sparkle patch with Xcode.
 
 Run it wherever your build pipeline needs a fresh native addon for the target Electron ABI — typically one of:
 
@@ -88,7 +88,7 @@ For advanced layouts, `loadSparkleBridge(deps)` (the lower-level function `loadS
 
 ## Packaging
 
-Packaging fails unless `rebuild` has already run: both the native addon (`native/build/Release/sparkle_bridge.node`, unpacked into the packaged app) and `native/vendor/Sparkle.framework` (read by the `extraFiles` entry below) are produced by that command, not by `pnpm install` or `tsc`.
+Run `rebuild` before packaging. It extracts the prebuilt universal framework from the npm package into `native/vendor/Sparkle.framework` and compiles the N-API addon for your Electron version. Framework symlinks are preserved inside `native/sparkle-chain.tar.xz`; the builder excludes that archive from the application. App release CI does not compile Sparkle. Publishing this library runs `prepack`, which builds the framework from pinned source and the checked-in patch when needed (full Xcode required).
 
 `sparkleBuilderConfig` returns the electron-builder config fragment this library needs — extend, don't replace, your existing config:
 
@@ -181,7 +181,7 @@ electron-sparkle-updater fix-appcast <appcast-dir>/appcast.xml --repo <owner/rep
 
 ### Composite GitHub Action
 
-`action/action.yml` encapsulates the whole per-release Sparkle flow: fetching pinned Sparkle tools, optionally downloading delta-base archives, signing + generating the appcast with the private key held only on a RAM disk, re-pointing enclosures, and (optionally) publishing the GitHub Release. It **requires a macOS runner** (uses `hdiutil`/`diskutil`/`shasum`) and a `GH_TOKEN`/`github-token` with permission to list/download/create releases on the target repo. The enclosure re-pointing step runs `npx electron-sparkle-updater fix-appcast`, so the calling workspace must already have `electron-sparkle-updater` installed as a dependency — the Action does not build this repo from source.
+`action/action.yml` fetches pinned upstream generation tools, downloads up to `delta-bases` historical ZIPs, generates deltas only to the current build, and merges bounded historical appcast metadata. Historical delta URLs and signatures remain unchanged; their files are neither downloaded nor re-uploaded. The final merged feed is signed while the EdDSA key is still on the RAM disk. It requires macOS and `github-token` access to the release repository. Use one archive directory/feed per architecture; the Action selects published, non-prerelease tags matching `tag-prefix`.
 
 Generate-only, let the caller publish (`publish` defaults to `false`):
 
@@ -221,10 +221,28 @@ jobs:
           tag: ${{ github.ref_name }}
           archive-dir: dist/release
           ed-private-key: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          delta-bases: "2"
+          delta-history: "6"
           publish: "true"
           dmg-path: dist/release/MyApp.dmg
           notes-file: dist/release-notes.md
 ```
+
+## Bounded delta chains
+
+The bundled framework is Sparkle 2.9.4 plus [a pinned source patch](native/patches/README.md). Stock Sparkle clients still read the same appcast and use direct deltas or full archives.
+
+- `delta-bases` (Action, default 2) bounds full-archive downloads and new delta generation per release.
+- `delta-history` (Action, default 6) keeps the current build plus up to six prior release versions. The first run can backfill small historical appcasts; subsequent releases inherit the previous snapshot.
+- `deltaHistory` (`sparkleBuilderConfig`, default 6), or `SUDeltaChainHistory` in the app's Info.plist, bounds the client's search. Values are integers from 0 to 32; client value 0 restores stock single-hop selection.
+
+The updater picks the smallest total download within that window, breaking ties in favor of fewer patches. No compatible path, a source outside the window, or a chain as large as the full ZIP selects the full archive. Download or patch failure falls back to the final full archive once. Cancellation stops the update without initiating a fallback.
+
+Each patch is authenticated using the installed application's signing key before it is applied. Each staged bundle is validated, including its expected build version and signing identity. Intermediate apps are never launched or installed. A key rotation or unsupported patch format rejects the chain and uses the normal full-update path. Partial chains are not resumed after process exit.
+
+`setEventHandler` reports only the final target, cumulative download progress, and final readiness. A full fallback starts a new download progress range. Keep “download complete” separate from `update-downloaded`: patches must finish applying and validating before installation is ready.
+
+New clients must first receive the patched framework through a normal update before they can execute chains. See [native verification](native/patches/README.md) for the planner, signed-app integration and real Kansoku checks.
 
 ## Fallback updater (`./fallback`)
 

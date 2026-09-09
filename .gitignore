@@ -6,3 +6,6 @@ native/vendor/
 
 !test/fixtures/consumer-with-electron/node_modules/
 !test/fixtures/consumer-with-electron/node_modules/**
+
+__pycache__/
+native/sparkle-chain.tar.xz

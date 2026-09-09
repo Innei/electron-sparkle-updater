@@ -1,12 +1,8 @@
 name: electron-sparkle-updater release
 description: >
-  Sign a macOS Electron release with Sparkle's EdDSA tooling, generate (and delta-diff)
-  its appcast.xml, repoint enclosure URLs at each asset's own release tag, and optionally
-  publish the GitHub Release. Requires a macOS runner (uses hdiutil/diskutil/shasum) and
-  a repo where the caller has already run its own package-manager install with
-  electron-sparkle-updater as a dependency — the enclosure re-pointing step shells out to
-  that install's `npx electron-sparkle-updater fix-appcast` rather than building this repo
-  from source.
+  Sign a macOS release, generate deltas to the current version, retain bounded
+  historical delta references, and optionally publish to GitHub Releases.
+  Requires a macOS runner and one archive directory/feed per architecture.
 
 inputs:
   tag:
@@ -53,6 +49,10 @@ inputs:
     description: How many previous releases' zips to fetch as delta-patch bases.
     required: false
     default: "2"
+  delta-history:
+    description: Number of previous desktop releases to retain for delta chains (0-32).
+    required: false
+    default: "6"
   fetch-delta-bases:
     description: Whether to fetch previous appcast.xml + zips at all (set false for a first release).
     required: false
@@ -109,45 +109,29 @@ runs:
           echo "EOF_OWN_RELEASE_ZIPS"
         } >> "$GITHUB_ENV"
 
-    - name: fetch existing appcast + last N release archives (delta base)
+    - name: fetch delta bases and bounded history metadata
       if: ${{ inputs.fetch-delta-bases == 'true' }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ inputs.repo }}
+        TAG: ${{ inputs.tag }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
         DELTA_BASES: ${{ inputs.delta-bases }}
+        DELTA_HISTORY: ${{ inputs.delta-history }}
         ARCHIVE_DIR: ${{ inputs.archive-dir }}
       run: |
         set -euo pipefail
-        # old zips are fetched into the same dir generate_appcast scans so it can
-        # diff them for deltas, but they must NOT be re-uploaded as this release's
-        # own assets — the publish step only uploads this release's own zip(s)
-        # (recorded above, before this step adds any old ones), plus dmg/appcast/deltas.
-        # The target repo may also host non-<tag-prefix> releases, so these queries
-        # filter explicitly by tag-prefix rather than trusting "latest across the whole
-        # repo" — an unrelated release published afterwards would otherwise get picked
-        # as the delta base.
-        [[ "$DELTA_BASES" =~ ^[0-9]+$ ]] || { echo "::error::delta-bases must be a non-negative integer"; exit 1; }
-        LATEST_TAG="$(gh release list --repo "$REPO" --exclude-drafts --limit 20 --json tagName \
-          -q "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))][0].tagName" 2>/dev/null || true)"
-        if [ -n "$LATEST_TAG" ]; then
-          gh release download --repo "$REPO" --pattern 'appcast.xml' --dir "$ARCHIVE_DIR" "$LATEST_TAG" \
-            || echo "no appcast.xml asset on latest release $LATEST_TAG"
-        else
-          echo "no previous release found — generate_appcast will create a fresh appcast.xml"
-        fi
-        PREV_TAGS="$(gh release list --repo "$REPO" --exclude-drafts --limit 20 --json tagName \
-          -q "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))][0:${DELTA_BASES}][].tagName" 2>/dev/null || true)"
-        for T in $PREV_TAGS; do
-          gh release download --repo "$REPO" --pattern '*.zip' --dir "$ARCHIVE_DIR" "$T" \
-            || echo "no zip asset on release $T, skipping"
-        done
+        python3 "$GITHUB_ACTION_PATH/../native/scripts/appcast-history.py" fetch \
+          --repo "$REPO" --tag "$TAG" --tag-prefix "$TAG_PREFIX" \
+          --archive-dir "$ARCHIVE_DIR" --bases "$DELTA_BASES" --history "$DELTA_HISTORY"
 
     - name: sign + generate appcast (EdDSA key lives only on a RAM disk)
       shell: bash
       env:
         SPARKLE_ED_PRIVATE_KEY: ${{ inputs.ed-private-key }}
+        DELTA_BASES: ${{ inputs.delta-bases }}
+        DELTA_HISTORY: ${{ inputs.delta-history }}
         REPO: ${{ inputs.repo }}
         TAG: ${{ inputs.tag }}
         ARCHIVE_DIR: ${{ inputs.archive-dir }}
@@ -171,24 +155,22 @@ runs:
         }
         trap cleanup EXIT
 
+        [[ "$DELTA_BASES" =~ ^[0-9]+$ ]] && (( DELTA_BASES <= 32 )) || { echo "delta-bases must be 0-32"; exit 1; }
+        [[ "$DELTA_HISTORY" =~ ^[0-9]+$ ]] && (( DELTA_HISTORY <= 32 )) || { echo "delta-history must be 0-32"; exit 1; }
+        [[ "$OWN_RELEASE_ZIPS" != *$'\n'* && -n "$OWN_RELEASE_ZIPS" ]] || { echo "Use one archive directory per architecture"; exit 1; }
+        CURRENT_BUILD_VERSION="$(python3 "$GITHUB_ACTION_PATH/../native/scripts/appcast-history.py" version "$ARCHIVE_DIR/$OWN_RELEASE_ZIPS")"
         generate_appcast \
+          --versions "$CURRENT_BUILD_VERSION" \
+          --maximum-versions 1 \
+          --maximum-deltas "$DELTA_BASES" \
           --ed-key-file "$KEY_FILE" \
           --download-url-prefix "$DOWNLOAD_URL_PREFIX" \
           --embed-release-notes \
           --full-release-notes-url "$FULL_RELEASE_NOTES_URL" \
           "$ARCHIVE_DIR"
-
-    - name: repoint old appcast enclosures at their own release tags
-      shell: bash
-      env:
-        ARCHIVE_DIR: ${{ inputs.archive-dir }}
-        REPO: ${{ inputs.repo }}
-        TAG_PREFIX: ${{ inputs.tag-prefix }}
-      run: |
-        set -euo pipefail
-        npx electron-sparkle-updater fix-appcast "$ARCHIVE_DIR/appcast.xml" \
-          --repo "$REPO" \
-          --tag-prefix "$TAG_PREFIX"
+        python3 "$GITHUB_ACTION_PATH/../native/scripts/appcast-history.py" merge "$ARCHIVE_DIR/appcast.xml" \
+          --history-dir "$ARCHIVE_DIR/history" --history "$DELTA_HISTORY"
+        sign_update --ed-key-file "$KEY_FILE" "$ARCHIVE_DIR/appcast.xml"
 
     - name: publish GitHub Release
       if: ${{ inputs.publish == 'true' }}

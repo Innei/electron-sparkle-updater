@@ -11,6 +11,10 @@ import {
 import type { ExecFileFn } from "./builder.js";
 
 describe("sparkleBuilderConfig", () => {
+  it("rejects an invalid delta window before returning a packaging config", () => {
+    expect(() => sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml", deltaHistory: -1 })).toThrow(RangeError);
+    expect(() => sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml", deltaHistory: 2.5 })).toThrow(RangeError);
+  });
   it("applies defaults when publicEdKey and scheduledCheckIntervalSeconds are omitted", () => {
     const config = sparkleBuilderConfig({ feedUrl: "https://example.com/appcast.xml" });
     expect(config).toEqual({
@@ -20,7 +24,7 @@ describe("sparkleBuilderConfig", () => {
           to: "Frameworks/Sparkle.framework",
         },
       ],
-      files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**"],
+      files: ["!**/node_modules/electron-sparkle-updater/native/vendor/**", "!**/node_modules/electron-sparkle-updater/native/sparkle-chain.tar.xz"],
       asarUnpack: ["**/node_modules/electron-sparkle-updater/native/build/Release/*.node"],
       dmg: { writeUpdateInfo: false },
       zip: { writeUpdateInfo: false },
@@ -30,6 +34,7 @@ describe("sparkleBuilderConfig", () => {
           SUPublicEDKey: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER,
           SUEnableInstallerLauncherService: false,
           SUScheduledCheckInterval: 3600,
+        SUDeltaChainHistory: 6,
           CFBundleLocalizations: sparkleLocalizations(),
         },
       },

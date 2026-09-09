@@ -1,6 +1,6 @@
 {
   "name": "electron-sparkle-updater",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "license": "MIT",
   "description": "Sparkle-based auto-updates for Electron apps on macOS.",
@@ -29,16 +29,20 @@
     "bin",
     "native/src",
     "native/binding.gyp",
-    "native/scripts",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "native/patches",
+    "native/sparkle-chain.tar.xz",
+    "native/scripts/*.sh",
+    "native/scripts/*.py"
   ],
   "scripts": {
     "install": "node -e \"\"",
     "build": "tsc -p tsconfig.build.json",
-    "prepublishOnly": "pnpm build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:history": "python3 -B -m unittest discover -s native/tests -p 'test_*.py'",
+    "prepack": "pnpm build && bash native/scripts/package-sparkle.sh"
   },
   "peerDependencies": {
     "electron": ">=28"
