@@ -270,18 +270,45 @@ index 39b11e9..ae5d013 100644
  				72C56E1F2F04AC890005A484 /* SUFeedSignatureVerifierTest.swift in Sources */,
  				72D04F3E2B097D4300A6DEAA /* SPUVerifierInformation.m in Sources */,
 diff --git a/Sparkle/SPUCoreBasedUpdateDriver.m b/Sparkle/SPUCoreBasedUpdateDriver.m
-index 563a136..bd92a56 100644
+index 563a136..68f4774 100644
 --- a/Sparkle/SPUCoreBasedUpdateDriver.m
 +++ b/Sparkle/SPUCoreBasedUpdateDriver.m
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,9 @@
  #import "SPUDownloadedUpdate.h"
  #import "SPUInformationalUpdate.h"
  #import "SUAppcastItem.h"
 +#import "SUAppcastItem+Private.h"
++#import "SUSignatureVerifier.h"
++#import "SPUVerifierInformation.h"
  #import "SULocalizations.h"
  #import "SPUInstallationType.h"
  #import "SUPhasedUpdateGroupInfo.h"
-@@ -33,6 +34,9 @@ @implementation SPUCoreBasedUpdateDriver
+@@ -29,10 +32,34 @@
+ @interface SPUCoreBasedUpdateDriver () <SPUBasicUpdateDriverDelegate, SPUDownloadDriverDelegate, SPUInstallerDriverDelegate>
+ @end
+ 
++// The installer re-authenticates every patch; this only stops the chain before
++// more bytes are fetched, so an unreadable download (sandboxed XPC container)
++// is not treated as a failure.
++static BOOL SUDeltaDownloadPassesSignatureCheck(SUHost *host, SPUDownloadedUpdate *download)
++{
++    BOOL stale = NO;
++    NSURL *url = [NSURL URLByResolvingBookmarkData:download.downloadBookmarkData options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&stale error:NULL];
++    NSString *path = url.path;
++    if (path == nil || ![NSFileManager.defaultManager isReadableFileAtPath:path]) return YES;
++    SUAppcastItem *item = download.updateItem;
++    SUSignatures *signatures = item.signatures;
++    if (signatures == nil) return YES;
++    SPUVerifierInformation *information = [[SPUVerifierInformation alloc] initWithExpectedVersion:item.versionString expectedContentLength:item.contentLength];
++    information.actualContentLength = [NSFileManager.defaultManager attributesOfItemAtPath:path error:NULL].fileSize;
++    NSError *error = nil;
++    if ([SUSignatureVerifier validatePath:path withSignatures:signatures withPublicKeys:host.publicKeys verifierInformation:information error:&error]) return YES;
++    SULog(SULogLevelError, @"Delta %@ failed signature verification after download. Falling back to regular update...", item.versionString);
++    SULogError(error);
++    return NO;
++}
++
+ @implementation SPUCoreBasedUpdateDriver
  {
      SPUBasicUpdateDriver *_basicDriver;
      SPUDownloadDriver *_downloadDriver;
@@ -291,7 +318,7 @@ index 563a136..bd92a56 100644
      SPUInstallerDriver *_installerDriver;
      SUAppcastItem *_updateItem;
      SUAppcastItem * _Nullable _secondaryUpdateItem;
-@@ -127,6 +131,13 @@ - (void)basicDriverDidFindUpdateWithAppcastItem:(SUAppcastItem *)updateItem seco
+@@ -127,6 +154,13 @@ - (void)basicDriverDidFindUpdateWithAppcastItem:(SUAppcastItem *)updateItem seco
  
  - (void)downloadUpdateFromAppcastItem:(SUAppcastItem *)updateItem secondaryAppcastItem:(SUAppcastItem * _Nullable)secondaryUpdateItem inBackground:(BOOL)background SPU_OBJC_DIRECT
  {
@@ -305,7 +332,7 @@ index 563a136..bd92a56 100644
      _downloadDriver = [[SPUDownloadDriver alloc] initWithUpdateItem:updateItem secondaryUpdateItem:secondaryUpdateItem host:_host userAgent:_userAgent httpHeaders:_httpHeaders inBackground:background delegate:self];
      
      id updater = _updater;
-@@ -141,6 +152,7 @@ - (void)downloadUpdateFromAppcastItem:(SUAppcastItem *)updateItem secondaryAppca
+@@ -141,6 +175,7 @@ - (void)downloadUpdateFromAppcastItem:(SUAppcastItem *)updateItem secondaryAppca
  
  - (void)downloadDriverWillBeginDownload
  {
@@ -313,7 +340,7 @@ index 563a136..bd92a56 100644
      id<SPUCoreBasedUpdateDriverDelegate> delegate = _delegate;
      if ([delegate respondsToSelector:@selector(downloadDriverWillBeginDownload)]) {
          [delegate downloadDriverWillBeginDownload];
-@@ -151,7 +163,7 @@ - (void)downloadDriverDidReceiveExpectedContentLength:(uint64_t)expectedContentL
+@@ -151,7 +186,7 @@ - (void)downloadDriverDidReceiveExpectedContentLength:(uint64_t)expectedContentL
  {
      id<SPUCoreBasedUpdateDriverDelegate> delegate = _delegate;
      if ([delegate respondsToSelector:@selector(downloadDriverDidReceiveExpectedContentLength:)]) {
@@ -322,11 +349,16 @@ index 563a136..bd92a56 100644
      }
  }
  
-@@ -165,6 +177,20 @@ - (void)downloadDriverDidReceiveDataOfLength:(uint64_t)length
+@@ -165,6 +200,25 @@ - (void)downloadDriverDidReceiveDataOfLength:(uint64_t)length
  
  - (void)downloadDriverDidDownloadUpdate:(SPUDownloadedUpdate *)downloadedUpdate
  {
 +    if (_deltaPlan != nil) {
++        if (!SUDeltaDownloadPassesSignatureCheck(_host, downloadedUpdate)) {
++            [_downloadDriver removeDownloadedUpdate:downloadedUpdate];
++            [self fallBackAndDownloadRegularUpdate];
++            return;
++        }
 +        if (_deltaDownloads.count + 1 < _deltaPlan.count) {
 +            [_deltaDownloads addObject:downloadedUpdate];
 +            SUAppcastItem *next = _deltaPlan[_deltaDownloads.count];
@@ -343,7 +375,7 @@ index 563a136..bd92a56 100644
      // Use a new update group for our next downloaded update
      // We could restrict this to when the appcast was downloaded in the background,
      // but it shouldn't matter.
-@@ -365,6 +391,9 @@ - (void)fallBackAndDownloadRegularUpdate SPU_OBJC_DIRECT
+@@ -365,6 +419,9 @@ - (void)fallBackAndDownloadRegularUpdate SPU_OBJC_DIRECT
      assert(secondaryUpdateItem != nil);
      
      BOOL backgroundDownload = _downloadDriver.inBackground;
@@ -353,7 +385,7 @@ index 563a136..bd92a56 100644
      
      // Fall back to the non-delta update. Note that we don't want to trigger another update was found event.
      _updateItem = secondaryUpdateItem;
-@@ -383,6 +412,9 @@ - (void)installerDidFailToApplyDeltaUpdate
+@@ -383,6 +440,9 @@ - (void)installerDidFailToApplyDeltaUpdate
  - (void)abortUpdateAndShowNextUpdateImmediately:(BOOL)shouldShowUpdateImmediately error:(nullable NSError *)error
  {
      [_installerDriver abortInstall];

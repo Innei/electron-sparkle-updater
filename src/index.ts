@@ -21,9 +21,11 @@ export interface SparkleBridgeEvent {
   releaseName?: string;
   releaseDate?: string;
   releaseNotes?: string;
+  phase?: "download" | "apply";
   percent?: number;
   transferred?: number;
   total?: number;
+  fallback?: boolean;
   message?: string;
 }
 

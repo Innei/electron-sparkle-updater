@@ -45,7 +45,7 @@ static void Event(NSString *event) { fprintf(stdout, "%s\n", event.UTF8String); 
     }
 }
 - (void)showDownloadDidStartExtractingUpdate { Event(@"extracting"); }
-- (void)showExtractionReceivedProgress:(double)progress {}
+- (void)showExtractionReceivedProgress:(double)progress { Event([NSString stringWithFormat:@"progress %.3f", progress]); }
 - (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply {
     Event(@"ready");
     reply(SPUUserUpdateChoiceInstall);
@@ -73,7 +73,9 @@ int main(int argc, const char *argv[]) {
         NSError *error = nil;
         if (![updater startUpdater:&error]) { Event(error.description); return 1; }
         dispatch_async(dispatch_get_main_queue(), ^{ [updater checkForUpdates]; });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Event(@"timeout"); exit(124); });
+        const char *timeout = getenv("CHAIN_TIMEOUT_SECONDS");
+        int64_t seconds = timeout != NULL ? atoll(timeout) : 90;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Event(@"timeout"); exit(124); });
         [NSApp run];
     }
     return 0;

@@ -67,6 +67,7 @@ static NSString *ISO8601String(NSDate *date) {
 @property(nonatomic, copy, nullable) void (^readyToInstallReply)(SPUUserUpdateChoice);
 @property(nonatomic, assign) uint64_t expectedContentLength;
 @property(nonatomic, assign) uint64_t receivedLength;
+@property(nonatomic, assign) NSUInteger downloadStarts;
 @property(nonatomic, assign) BOOL installWhenReady;
 @property(nonatomic, copy, nullable) NSString *updateVersion;
 @end
@@ -96,6 +97,7 @@ static NSString *ISO8601String(NSDate *date) {
                           ? appcastItem.displayVersionString
                           : appcastItem.versionString;
   self.updateVersion = version;
+  self.downloadStarts = 0;
 
   BOOL alreadyInstalling = state.stage == SPUUserUpdateStageInstalling && !self.installWhenReady;
   NSMutableDictionary *payload = [NSMutableDictionary dictionary];
@@ -138,6 +140,16 @@ static NSString *ISO8601String(NSDate *date) {
 - (void)showDownloadInitiatedWithCancellation:(void (^)(void))cancellation {
   self.receivedLength = 0;
   self.expectedContentLength = 0;
+  self.downloadStarts += 1;
+  if (self.downloadStarts > 1) {
+    EmitSparkleEvent(@{
+      @"type" : @"download-progress",
+      @"phase" : @"download",
+      @"percent" : @(0),
+      @"transferred" : @(0),
+      @"fallback" : @YES
+    });
+  }
 }
 
 - (void)showDownloadDidReceiveExpectedContentLength:(uint64_t)expectedContentLength {
@@ -148,6 +160,7 @@ static NSString *ISO8601String(NSDate *date) {
   self.receivedLength += length;
   NSMutableDictionary *payload = [NSMutableDictionary dictionary];
   payload[@"type"] = @"download-progress";
+  payload[@"phase"] = @"download";
   payload[@"transferred"] = @(self.receivedLength);
   if (self.expectedContentLength > 0) {
     payload[@"total"] = @(self.expectedContentLength);
@@ -161,6 +174,7 @@ static NSString *ISO8601String(NSDate *date) {
 - (void)showDownloadDidStartExtractingUpdate {
   NSMutableDictionary *payload = [NSMutableDictionary dictionary];
   payload[@"type"] = @"download-progress";
+  payload[@"phase"] = @"download";
   payload[@"percent"] = @(100);
   if (self.receivedLength > 0) payload[@"transferred"] = @(self.receivedLength);
   if (self.expectedContentLength > 0) payload[@"total"] = @(self.expectedContentLength);
@@ -168,6 +182,11 @@ static NSString *ISO8601String(NSDate *date) {
 }
 
 - (void)showExtractionReceivedProgress:(double)progress {
+  EmitSparkleEvent(@{
+    @"type" : @"download-progress",
+    @"phase" : @"apply",
+    @"percent" : @(MIN(100.0, MAX(0.0, progress * 100.0)))
+  });
 }
 
 - (void)showReadyToInstallAndRelaunch:(void (^)(SPUUserUpdateChoice))reply {
