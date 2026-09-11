@@ -136,6 +136,9 @@ def main():
                     assert downloads == ["download 1-3.delta", "download 3-5.delta", "download 5-6.delta"], text
                 if mode == "window":
                     assert downloads == ["download 6.zip"], text
+                if mode in ("corrupt", "missing"):
+                    assert downloads == ["download 1-3.delta", f"download {mode}.delta", "download 6.zip"], text
+                    assert text.splitlines().count("extracting") == 1, text
                 run("codesign", "--verify", "--deep", "--strict", host, **quiet)
             print(f"PASS {mode}: {', '.join(downloads)}", flush=True)
     finally:
