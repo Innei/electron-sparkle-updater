@@ -264,6 +264,12 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
                                               userDriver:g_userDriver
                                                 delegate:g_logDelegate];
 
+      // Sparkle persists URLs assigned through the deprecated setFeedURL: API in
+      // the host bundle's user defaults. Clear that legacy override before
+      // relying on the packaged SUFeedURL, otherwise existing installations can
+      // keep checking an old feed even after the app's Info.plist is corrected.
+      [g_updater clearFeedURLFromUserDefaults];
+
       NSString *plistFeedUrl = hostBundle.infoDictionary[@"SUFeedURL"];
       NSString *plistPublicKey = hostBundle.infoDictionary[@"SUPublicEDKey"];
 
