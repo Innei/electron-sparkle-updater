@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export interface SparkleInitOptions {
   appcastUrl: string;
-  publicEdKey: string;
+  publicEdKey?: string;
 }
 
 export type SparkleBridgeEventType =
@@ -33,6 +33,7 @@ export interface SparkleBridge {
   init(options: SparkleInitOptions): boolean;
   checkForUpdates(): void;
   installUpdateNow(): void;
+  installUpdateOnQuit(): void;
   setAutomaticChecks(enabled: boolean): void;
   setEventHandler(handler: (event: SparkleBridgeEvent) => void): void;
 }
@@ -90,6 +91,7 @@ export function loadSparkleBridge(deps: LoadSparkleBridgeDeps): SparkleBridge | 
       typeof addon.init !== "function" ||
       typeof addon.checkForUpdates !== "function" ||
       typeof addon.installUpdateNow !== "function" ||
+      typeof addon.installUpdateOnQuit !== "function" ||
       typeof addon.setAutomaticChecks !== "function" ||
       typeof addon.setEventHandler !== "function"
     ) {

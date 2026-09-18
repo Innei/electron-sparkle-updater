@@ -69,6 +69,7 @@ static NSString *ISO8601String(NSDate *date) {
 @property(nonatomic, assign) uint64_t receivedLength;
 @property(nonatomic, assign) NSUInteger downloadStarts;
 @property(nonatomic, assign) BOOL installWhenReady;
+@property(nonatomic, assign) BOOL installOnQuitWhenReady;
 @property(nonatomic, copy, nullable) NSString *updateVersion;
 @end
 
@@ -197,11 +198,18 @@ static NSString *ISO8601String(NSDate *date) {
     return;
   }
 
-  self.readyToInstallReply = [reply copy];
   NSMutableDictionary *payload = [NSMutableDictionary dictionary];
   payload[@"type"] = @"update-downloaded";
   if (self.updateVersion.length > 0) payload[@"version"] = self.updateVersion;
   EmitSparkleEvent(payload);
+
+  if (self.installOnQuitWhenReady) {
+    self.installOnQuitWhenReady = NO;
+    self.readyToInstallReply = nil;
+    reply(SPUUserUpdateChoiceDismiss);
+    return;
+  }
+  self.readyToInstallReply = [reply copy];
 }
 
 - (void)showInstallingUpdateWithApplicationTerminated:(BOOL)applicationTerminated
@@ -215,6 +223,7 @@ static NSString *ISO8601String(NSDate *date) {
 
 - (void)dismissUpdateInstallation {
   self.installWhenReady = NO;
+  self.installOnQuitWhenReady = NO;
   self.readyToInstallReply = nil;
 }
 
@@ -367,6 +376,28 @@ Napi::Value InstallUpdateNow(const Napi::CallbackInfo &info) {
   return env.Undefined();
 }
 
+// Sparkle keeps the staged installer alive after a Dismiss reply and finishes
+// the installation when the host process terminates on its own.
+Napi::Value InstallUpdateOnQuit(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  RunOnMain(^{
+    if (g_updater == nil || g_userDriver == nil) return;
+    @try {
+      void (^reply)(SPUUserUpdateChoice) = g_userDriver.readyToInstallReply;
+      if (reply != nil) {
+        g_userDriver.readyToInstallReply = nil;
+        g_userDriver.installWhenReady = NO;
+        reply(SPUUserUpdateChoiceDismiss);
+        return;
+      }
+      g_userDriver.installOnQuitWhenReady = YES;
+    } @catch (NSException *exception) {
+      NSLog(@"[sparkle-bridge] installUpdateOnQuit threw: %@", exception.reason);
+    }
+  });
+  return env.Undefined();
+}
+
 Napi::Value SetAutomaticChecks(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
@@ -411,6 +442,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
   exports.Set(Napi::String::New(env, "init"), Napi::Function::New(env, Init));
   exports.Set(Napi::String::New(env, "checkForUpdates"), Napi::Function::New(env, CheckForUpdates));
   exports.Set(Napi::String::New(env, "installUpdateNow"), Napi::Function::New(env, InstallUpdateNow));
+  exports.Set(Napi::String::New(env, "installUpdateOnQuit"), Napi::Function::New(env, InstallUpdateOnQuit));
   exports.Set(Napi::String::New(env, "setAutomaticChecks"), Napi::Function::New(env, SetAutomaticChecks));
   exports.Set(Napi::String::New(env, "setEventHandler"), Napi::Function::New(env, SetEventHandler));
   return exports;
