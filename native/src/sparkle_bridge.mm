@@ -256,6 +256,22 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
   NSString *appcastUrl = options.Has("appcastUrl") ? NapiStringToNSString(options.Get("appcastUrl")) : nil;
   NSString *publicEdKey = options.Has("publicEdKey") ? NapiStringToNSString(options.Get("publicEdKey")) : nil;
 
+  // dv1-updater patch (D-26): Sparkle's own SPUUpdater.httpHeaders (SPUUpdater.h,
+  // applied to both the appcast and enclosure fetch by SPUDownloadDriver) has no
+  // JS surface upstream -- this is that passthrough, string values only.
+  NSMutableDictionary<NSString *, NSString *> *httpHeaders = nil;
+  if (options.Has("httpHeaders") && options.Get("httpHeaders").IsObject()) {
+    Napi::Object headers = options.Get("httpHeaders").As<Napi::Object>();
+    Napi::Array keys = headers.GetPropertyNames();
+    httpHeaders = [NSMutableDictionary dictionaryWithCapacity:keys.Length()];
+    for (uint32_t i = 0; i < keys.Length(); i++) {
+      Napi::Value key = keys.Get(i);
+      NSString *nsKey = NapiStringToNSString(key);
+      NSString *nsValue = NapiStringToNSString(headers.Get(key.As<Napi::String>().Utf8Value()));
+      if (nsKey != nil && nsValue != nil) httpHeaders[nsKey] = nsValue;
+    }
+  }
+
   __block BOOL initialized = NO;
 
   void (^work)(void) = ^{
@@ -300,6 +316,10 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
             @"[sparkle-bridge] publicEdKey was supplied but Info.plist has no SUPublicEDKey; "
              "Sparkle has no supported runtime setter for it — the key must be baked into the "
              "signed Info.plist at package time.");
+      }
+
+      if (httpHeaders != nil) {
+        g_updater.httpHeaders = httpHeaders;
       }
 
       NSError *startError = nil;
