@@ -255,7 +255,11 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
   Napi::Object options = info[0].As<Napi::Object>();
   NSString *appcastUrl = options.Has("appcastUrl") ? NapiStringToNSString(options.Get("appcastUrl")) : nil;
   NSString *publicEdKey = options.Has("publicEdKey") ? NapiStringToNSString(options.Get("publicEdKey")) : nil;
-  Napi::Object headers = options.Has("httpHeaders") && options.Get("httpHeaders").IsObject() ? options.Get("httpHeaders").As<Napi::Object>() : Napi::Object();
+  // IsObject() is also true for a JS array; excluded explicitly so a caller who
+  // accidentally passes one doesn't get a literal "0"/"1"/... header instead of
+  // a clear no-op.
+  Napi::Value httpHeadersValue = options.Has("httpHeaders") ? options.Get("httpHeaders") : Napi::Value();
+  Napi::Object headers = !httpHeadersValue.IsEmpty() && httpHeadersValue.IsObject() && !httpHeadersValue.IsArray() ? httpHeadersValue.As<Napi::Object>() : Napi::Object();
 
   __block BOOL initialized = NO;
 
