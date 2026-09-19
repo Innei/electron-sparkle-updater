@@ -255,6 +255,11 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
   Napi::Object options = info[0].As<Napi::Object>();
   NSString *appcastUrl = options.Has("appcastUrl") ? NapiStringToNSString(options.Get("appcastUrl")) : nil;
   NSString *publicEdKey = options.Has("publicEdKey") ? NapiStringToNSString(options.Get("publicEdKey")) : nil;
+  // IsObject() is also true for a JS array; excluded explicitly so a caller who
+  // accidentally passes one doesn't get a literal "0"/"1"/... header instead of
+  // a clear no-op.
+  Napi::Value httpHeadersValue = options.Has("httpHeaders") ? options.Get("httpHeaders") : Napi::Value();
+  Napi::Object headers = !httpHeadersValue.IsEmpty() && httpHeadersValue.IsObject() && !httpHeadersValue.IsArray() ? httpHeadersValue.As<Napi::Object>() : Napi::Object();
 
   __block BOOL initialized = NO;
 
@@ -262,6 +267,23 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
     if (g_updater != nil) {
       initialized = YES;
       return;
+    }
+
+    // Sparkle's own SPUUpdater.httpHeaders (SPUUpdater.h, applied to both the
+    // appcast and enclosure fetch by SPUDownloadDriver) had no JS surface --
+    // this is that passthrough, string values only. Parsed here, not above,
+    // so a repeat init() call (the g_updater != nil no-op above) never pays
+    // for it.
+    NSMutableDictionary<NSString *, NSString *> *httpHeaders = nil;
+    if (!headers.IsEmpty()) {
+      Napi::Array keys = headers.GetPropertyNames();
+      httpHeaders = [NSMutableDictionary dictionaryWithCapacity:keys.Length()];
+      for (uint32_t i = 0; i < keys.Length(); i++) {
+        Napi::Value key = keys.Get(i);
+        NSString *nsKey = NapiStringToNSString(key);
+        NSString *nsValue = NapiStringToNSString(headers.Get(key));
+        if (nsKey != nil && nsValue != nil) httpHeaders[nsKey] = nsValue;
+      }
     }
 
     @try {
@@ -300,6 +322,10 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
             @"[sparkle-bridge] publicEdKey was supplied but Info.plist has no SUPublicEDKey; "
              "Sparkle has no supported runtime setter for it — the key must be baked into the "
              "signed Info.plist at package time.");
+      }
+
+      if (httpHeaders != nil) {
+        g_updater.httpHeaders = httpHeaders;
       }
 
       NSError *startError = nil;
