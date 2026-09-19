@@ -255,22 +255,7 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
   Napi::Object options = info[0].As<Napi::Object>();
   NSString *appcastUrl = options.Has("appcastUrl") ? NapiStringToNSString(options.Get("appcastUrl")) : nil;
   NSString *publicEdKey = options.Has("publicEdKey") ? NapiStringToNSString(options.Get("publicEdKey")) : nil;
-
-  // dv1-updater patch (D-26): Sparkle's own SPUUpdater.httpHeaders (SPUUpdater.h,
-  // applied to both the appcast and enclosure fetch by SPUDownloadDriver) has no
-  // JS surface upstream -- this is that passthrough, string values only.
-  NSMutableDictionary<NSString *, NSString *> *httpHeaders = nil;
-  if (options.Has("httpHeaders") && options.Get("httpHeaders").IsObject()) {
-    Napi::Object headers = options.Get("httpHeaders").As<Napi::Object>();
-    Napi::Array keys = headers.GetPropertyNames();
-    httpHeaders = [NSMutableDictionary dictionaryWithCapacity:keys.Length()];
-    for (uint32_t i = 0; i < keys.Length(); i++) {
-      Napi::Value key = keys.Get(i);
-      NSString *nsKey = NapiStringToNSString(key);
-      NSString *nsValue = NapiStringToNSString(headers.Get(key.As<Napi::String>().Utf8Value()));
-      if (nsKey != nil && nsValue != nil) httpHeaders[nsKey] = nsValue;
-    }
-  }
+  Napi::Object headers = options.Has("httpHeaders") && options.Get("httpHeaders").IsObject() ? options.Get("httpHeaders").As<Napi::Object>() : Napi::Object();
 
   __block BOOL initialized = NO;
 
@@ -278,6 +263,23 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
     if (g_updater != nil) {
       initialized = YES;
       return;
+    }
+
+    // Sparkle's own SPUUpdater.httpHeaders (SPUUpdater.h, applied to both the
+    // appcast and enclosure fetch by SPUDownloadDriver) had no JS surface --
+    // this is that passthrough, string values only. Parsed here, not above,
+    // so a repeat init() call (the g_updater != nil no-op above) never pays
+    // for it.
+    NSMutableDictionary<NSString *, NSString *> *httpHeaders = nil;
+    if (!headers.IsEmpty()) {
+      Napi::Array keys = headers.GetPropertyNames();
+      httpHeaders = [NSMutableDictionary dictionaryWithCapacity:keys.Length()];
+      for (uint32_t i = 0; i < keys.Length(); i++) {
+        Napi::Value key = keys.Get(i);
+        NSString *nsKey = NapiStringToNSString(key);
+        NSString *nsValue = NapiStringToNSString(headers.Get(key));
+        if (nsKey != nil && nsValue != nil) httpHeaders[nsKey] = nsValue;
+      }
     }
 
     @try {
