@@ -279,6 +279,13 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
       // keep checking an old feed even after the app's Info.plist is corrected.
       [g_updater clearFeedURLFromUserDefaults];
 
+      // SUAutomaticallyUpdate (often left on by a previous standard-driver build) routes
+      // scheduled checks through Sparkle's automatic driver, which bypasses this user
+      // driver: no events reach JS, and -checkForUpdates is ignored while that background
+      // download runs, so installUpdateNow() silently does nothing. SilentUserDriver
+      // already downloads every found update, so the preference only removes visibility.
+      g_updater.automaticallyDownloadsUpdates = NO;
+
       NSString *plistFeedUrl = hostBundle.infoDictionary[@"SUFeedURL"];
       NSString *plistPublicKey = hostBundle.infoDictionary[@"SUPublicEDKey"];
 

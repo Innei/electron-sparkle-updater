@@ -72,6 +72,8 @@ if (bridge) {
 
 The native user driver is silent: Sparkle never presents its permission, found-update, progress, or install dialogs. Download progress and ready-to-install land on `setEventHandler`; `installUpdateNow()` is what relaunches, and `installUpdateOnQuit()` defers the install to the app's own termination.
 
+`init` turns off Sparkle's `automaticallyDownloadsUpdates` (`SUAutomaticallyUpdate`). The silent driver already downloads every update it finds. Leaving the setting on would send scheduled checks through Sparkle's own background driver, and that driver emits no events. `installUpdateNow()` is also ignored while that background download runs.
+
 `SparkleBridge` exposes:
 
 | Method | Purpose |
