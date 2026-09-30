@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 export interface SparkleInitOptions {
   appcastUrl: string;
   publicEdKey?: string;
+  /** Applied to both the appcast and update-enclosure fetch (SPUUpdater.httpHeaders). */
+  httpHeaders?: Record<string, string>;
 }
 
 export type SparkleBridgeEventType =
