@@ -128,6 +128,7 @@ describe("loadSparkleBridge", () => {
       expect(typeof result.checkForUpdates).toBe("function");
       expect(typeof result.installUpdateNow).toBe("function");
       expect(typeof result.installUpdateOnQuit).toBe("function");
+      expect(typeof result.discardDownloadedUpdate).toBe("function");
       expect(typeof result.setAutomaticChecks).toBe("function");
       expect(typeof result.setEventHandler).toBe("function");
     } else {

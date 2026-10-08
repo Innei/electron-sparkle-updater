@@ -18,6 +18,10 @@ static void EmitSparkleEvent(NSDictionary *payload) {
   auto *json = new std::string(static_cast<const char *>(data.bytes), data.length);
   napi_status status = g_eventTsfn.NonBlockingCall(
       json, [](Napi::Env env, Napi::Function jsCallback, std::string *json) {
+        if (env == nullptr || jsCallback.IsEmpty()) {
+          delete json;
+          return;
+        }
         Napi::Value parsed = env.Global()
                                  .Get("JSON")
                                  .As<Napi::Object>()
@@ -41,9 +45,16 @@ static NSString *ISO8601String(NSDate *date) {
 }
 
 @interface SparkleBridgeLogDelegate : NSObject <SPUUpdaterDelegate>
+@property(nonatomic, copy, nullable) NSString *appcastUrl;
+@property(nonatomic, assign) BOOL checkWhenReady;
+@property(nonatomic, assign) NSTimeInterval checkDelay;
 @end
 
 @implementation SparkleBridgeLogDelegate
+
+- (nullable NSString *)feedURLStringForUpdater:(SPUUpdater *)updater {
+  return self.appcastUrl;
+}
 
 - (void)updater:(SPUUpdater *)updater
     didFinishUpdateCycleForUpdateCheck:(SPUUpdateCheck)updateCheck
@@ -52,6 +63,13 @@ static NSString *ISO8601String(NSDate *date) {
     NSLog(@"[sparkle-bridge] update cycle finished with error: %@", error);
   } else {
     NSLog(@"[sparkle-bridge] update cycle finished with no error (no update found or update path taken)");
+  }
+  if (self.checkWhenReady) {
+    self.checkWhenReady = NO;
+    NSTimeInterval delay = self.checkDelay;
+    self.checkDelay = 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [updater checkForUpdates]; });
   }
 }
 
@@ -70,6 +88,9 @@ static NSString *ISO8601String(NSDate *date) {
 @property(nonatomic, assign) NSUInteger downloadStarts;
 @property(nonatomic, assign) BOOL installWhenReady;
 @property(nonatomic, assign) BOOL installOnQuitWhenReady;
+@property(nonatomic, assign) BOOL discardResumedUpdate;
+@property(nonatomic, assign) NSUInteger resumeRetries;
+@property(nonatomic, weak, nullable) SparkleBridgeLogDelegate *logDelegate;
 @property(nonatomic, copy, nullable) NSString *updateVersion;
 @end
 
@@ -87,6 +108,17 @@ static NSString *ISO8601String(NSDate *date) {
 - (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)appcastItem
                                  state:(SPUUserUpdateState *)state
                                  reply:(void (^)(SPUUserUpdateChoice))reply {
+  self.resumeRetries = 0;
+  BOOL discard = self.discardResumedUpdate && state.stage != SPUUserUpdateStageNotDownloaded;
+  self.discardResumedUpdate = NO;
+  if (discard) {
+    // Sparkle resumes a staged update without reading the appcast, so drop it and let the
+    // follow-up check fetch the newer release.
+    self.logDelegate.checkWhenReady = YES;
+    reply(SPUUserUpdateChoiceSkip);
+    return;
+  }
+
   if (appcastItem.informationOnlyUpdate) {
     self.installWhenReady = NO;
     EmitSparkleEvent(@{@"type" : @"error", @"message" : @"informational update"});
@@ -124,6 +156,7 @@ static NSString *ISO8601String(NSDate *date) {
 }
 
 - (void)showUpdateNotFoundWithError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
+  self.resumeRetries = 0;
   self.installWhenReady = NO;
   self.readyToInstallReply = nil;
   EmitSparkleEvent(@{@"type" : @"update-not-available"});
@@ -131,6 +164,17 @@ static NSString *ISO8601String(NSDate *date) {
 }
 
 - (void)showUpdaterError:(NSError *)error acknowledgement:(void (^)(void))acknowledgement {
+  // Sparkle probes the installer twice when resuming; a staged update cancelled in between (e.g.
+  // just discarded) leaves nothing to resume, so read the appcast instead once the installer exits.
+  if ([error.domain isEqualToString:SUSparkleErrorDomain] && error.code == SUResumeAppcastError &&
+      self.resumeRetries < 3) {
+    self.resumeRetries += 1;
+    self.logDelegate.checkDelay = 1;
+    self.logDelegate.checkWhenReady = YES;
+    acknowledgement();
+    return;
+  }
+  self.resumeRetries = 0;
   self.installWhenReady = NO;
   self.readyToInstallReply = nil;
   NSString *message = error.localizedDescription.length > 0 ? error.localizedDescription : @"sparkle_error";
@@ -260,13 +304,23 @@ Napi::Value Init(const Napi::CallbackInfo &info) {
 
   void (^work)(void) = ^{
     if (g_updater != nil) {
+      if (![g_logDelegate.appcastUrl isEqualToString:appcastUrl] && g_userDriver.readyToInstallReply != nil) {
+        // Discard an uninstalled download from the previous channel. User-initiated
+        // checks can still find this version if the user switches back later.
+        void (^reply)(SPUUserUpdateChoice) = g_userDriver.readyToInstallReply;
+        g_userDriver.readyToInstallReply = nil;
+        reply(SPUUserUpdateChoiceSkip);
+      }
+      g_logDelegate.appcastUrl = appcastUrl;
       initialized = YES;
       return;
     }
 
     @try {
       g_logDelegate = [[SparkleBridgeLogDelegate alloc] init];
+      g_logDelegate.appcastUrl = appcastUrl;
       g_userDriver = [[SilentUserDriver alloc] init];
+      g_userDriver.logDelegate = g_logDelegate;
       NSBundle *hostBundle = [NSBundle mainBundle];
       g_updater = [[SPUUpdater alloc] initWithHostBundle:hostBundle
                                        applicationBundle:hostBundle
@@ -353,6 +407,10 @@ Napi::Value CheckForUpdates(const Napi::CallbackInfo &info) {
     @try {
       NSLog(@"[sparkle-bridge] checkForUpdates: canCheckForUpdates=%d sessionInProgress=%d",
             g_updater.canCheckForUpdates, g_updater.sessionInProgress);
+      if (g_updater.sessionInProgress) {
+        g_logDelegate.checkWhenReady = YES;
+        return;
+      }
       [g_updater checkForUpdates];
     } @catch (NSException *exception) {
       NSLog(@"[sparkle-bridge] checkForUpdates threw: %@", exception.reason);
@@ -405,6 +463,27 @@ Napi::Value InstallUpdateOnQuit(const Napi::CallbackInfo &info) {
   return env.Undefined();
 }
 
+Napi::Value DiscardDownloadedUpdate(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  RunOnMain(^{
+    if (g_updater == nil || g_userDriver == nil) return;
+    @try {
+      g_userDriver.installWhenReady = NO;
+      g_userDriver.installOnQuitWhenReady = NO;
+      void (^reply)(SPUUserUpdateChoice) = g_userDriver.readyToInstallReply;
+      if (reply != nil) {
+        g_userDriver.readyToInstallReply = nil;
+        reply(SPUUserUpdateChoiceSkip);
+        return;
+      }
+      g_userDriver.discardResumedUpdate = YES;
+    } @catch (NSException *exception) {
+      NSLog(@"[sparkle-bridge] discardDownloadedUpdate threw: %@", exception.reason);
+    }
+  });
+  return env.Undefined();
+}
+
 Napi::Value SetAutomaticChecks(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
@@ -430,14 +509,15 @@ Napi::Value SetAutomaticChecks(const Napi::CallbackInfo &info) {
 Napi::Value SetEventHandler(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
-  if (info.Length() < 1 || !info[0].IsFunction()) {
-    Napi::TypeError::New(env, "setEventHandler(fn) requires a function").ThrowAsJavaScriptException();
+  if (info.Length() < 1 || (!info[0].IsFunction() && !info[0].IsNull())) {
+    Napi::TypeError::New(env, "setEventHandler(fn) requires a function or null").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
   if (g_hasEventHandler.exchange(false)) {
-    g_eventTsfn.Release();
+    g_eventTsfn.Abort();
   }
+  if (info[0].IsNull()) return env.Undefined();
 
   g_eventTsfn = Napi::ThreadSafeFunction::New(
       env, info[0].As<Napi::Function>(), "sparkle-events", 0, 1);
@@ -450,6 +530,7 @@ Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
   exports.Set(Napi::String::New(env, "checkForUpdates"), Napi::Function::New(env, CheckForUpdates));
   exports.Set(Napi::String::New(env, "installUpdateNow"), Napi::Function::New(env, InstallUpdateNow));
   exports.Set(Napi::String::New(env, "installUpdateOnQuit"), Napi::Function::New(env, InstallUpdateOnQuit));
+  exports.Set(Napi::String::New(env, "discardDownloadedUpdate"), Napi::Function::New(env, DiscardDownloadedUpdate));
   exports.Set(Napi::String::New(env, "setAutomaticChecks"), Napi::Function::New(env, SetAutomaticChecks));
   exports.Set(Napi::String::New(env, "setEventHandler"), Napi::Function::New(env, SetEventHandler));
   return exports;

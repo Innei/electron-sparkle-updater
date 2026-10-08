@@ -5,6 +5,7 @@ module.exports = {
   checkForUpdates() {},
   installUpdateNow() {},
   installUpdateOnQuit() {},
+  discardDownloadedUpdate() {},
   setAutomaticChecks() {},
   setEventHandler() {},
 };

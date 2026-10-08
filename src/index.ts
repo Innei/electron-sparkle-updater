@@ -34,8 +34,9 @@ export interface SparkleBridge {
   checkForUpdates(): void;
   installUpdateNow(): void;
   installUpdateOnQuit(): void;
+  discardDownloadedUpdate(): void;
   setAutomaticChecks(enabled: boolean): void;
-  setEventHandler(handler: (event: SparkleBridgeEvent) => void): void;
+  setEventHandler(handler: ((event: SparkleBridgeEvent) => void) | null): void;
 }
 
 interface ResolveSparkleAddonPathDeps {
@@ -92,6 +93,7 @@ export function loadSparkleBridge(deps: LoadSparkleBridgeDeps): SparkleBridge | 
       typeof addon.checkForUpdates !== "function" ||
       typeof addon.installUpdateNow !== "function" ||
       typeof addon.installUpdateOnQuit !== "function" ||
+      typeof addon.discardDownloadedUpdate !== "function" ||
       typeof addon.setAutomaticChecks !== "function" ||
       typeof addon.setEventHandler !== "function"
     ) {
